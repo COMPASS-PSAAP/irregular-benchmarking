@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.18)
 
-project(MyProject LANGUAGES C CXX VERSION 0.1.0)
+project(irregular-benchmarking LANGUAGES C CXX VERSION 0.1.0)
 
 # Default to C++17 so we can use if constexpr and [[maybe_unused]]
 # and so GTest/GMock can build

@@ -80,10 +80,23 @@ include_directories(${NLOHMANN_JSON_INCLUDE_DIR})
 #find_package(MPI REQUIRED)
 #target_link_libraries(main PRIVATE MPI::MPI_CXX)
 #find_package(vernier REQUIRED)
-#target_link_libraries( main vernier::vernier myproject )
+#target_link_libraries( main vernier::vernier irregular-benchmarking )
 
+# vernier_start
+find_library(VERNIER_LIBRARY vernier
+        PATHS
+        ${SPACK_PREFIX}/lib
+)
 
-target_link_libraries( main  myproject /g/g20/bacon4/benchmark25/lib/lib/libvernier.so)
+if (VERNIER_LIBRARY)
+    message(STATUS "Found vernier: ${VERNIER_LIBRARY}")
+    set(VERNIER_FOUND TRUE)
+else ()
+    message(FATAL_ERROR "vernier not found!")
+endif ()
+# vernier_end
+
+target_link_libraries( main  irregular-benchmarking ${VERNIER_LIBRARY})
 
 #target_link_libraries( main PRIVATE ${CALIPER_LIBRARY} )
 
