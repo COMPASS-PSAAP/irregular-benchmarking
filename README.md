@@ -10,24 +10,45 @@ reducing per-rank memory overhead.
 
 - CMake >= 3.18
 - MPI
-- [Cabana](https://github.com/ECP-copa/Cabana) (built with MPI and Grid/Cajita support)
+- [Cabana](https://github.com/ECP-copa/Cabana) (built with MPI, Grid/Cajita, and locality-aware support)
 - Kokkos (via Cabana)
-- MPI_Advance
+- [locality_aware](https://github.com/mpi-advance/locality_aware) (a.k.a. MPI_Advance; provides the locality-aware MPI extensions used for halo exchange)
 - [TCLAP](https://github.com/mirror/tclap)
 - [nlohmann/json](https://github.com/nlohmann/json)
-- vernier
+- [Vernier](https://github.com/MetOffice/Vernier) (profiling; depends on Caliper)
 
-All of these are expected from a Spack environment: `spack-envs/llnl/`
-contains Spack environments for supported systems (Dane, Tioga, Tuolumne).
-TCLAP, nlohmann/json, and vernier are located via `find_path`/`find_library`
-against `${SPACK_PREFIX}`, so point `SPACK_PREFIX` at the environment's view
-(or your compiler's default search paths) when configuring.
+### Spack environment
+
+`spack-envs/llnl/dane/spack.yaml` is a working Spack environment for Dane
+(`spack-envs/llnl/tioga/` and `spack-envs/llnl/tuolumne/` are still empty
+placeholders). It pulls `cabana` (with the `+locality_aware` variant) and
+`localityaware` from a custom repo
+([CUP-ECS/spack-packages](https://github.com/CUP-ECS/spack-packages),
+`cabana-locality-aware` branch), plus `tclap`, `nlohmann-json`, and
+`caliper` from builtin Spack.
+
+**Vernier has no Spack package** (checked both builtin Spack and the
+CUP-ECS repo above), so it isn't in `spack.yaml` and must be built and
+installed separately; point `SPACK_PREFIX`/`VERNIER_PREFIX`-equivalent
+paths at wherever you install it (see `find_library(VERNIER_LIBRARY ...)`
+in `src/CMakeLists.txt`).
+
+To build the environment:
+
+```bash
+spack env create irregular-benchmarking spack-envs/llnl/dane/spack.yaml
+spack env activate irregular-benchmarking
+spack install
+```
+
+Then use the environment's view (or `spack location -i <package>` for
+individual prefixes) as `SPACK_PREFIX` below.
 
 ## Building
 
 ```bash
 mkdir build && cd build
-cmake -DMPI_Advance_PREFIX=/path/to/mpi_advance \
+cmake -DMPI_Advance_PREFIX=/path/to/locality_aware \
       -DSPACK_PREFIX=/path/to/spack/env/view \
       ..
 make
