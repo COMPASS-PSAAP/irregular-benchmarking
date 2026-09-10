@@ -14,41 +14,26 @@ reducing per-rank memory overhead.
 - Kokkos (via Cabana)
 - MPI_Advance
 - NuMesh
-- [TCLAP](https://github.com/mirror/tclap) (vendored as a git submodule)
+- [TCLAP](https://github.com/mirror/tclap)
 - [nlohmann/json](https://github.com/nlohmann/json)
-- [BLT](https://github.com/LLNL/blt) (vendored as a git submodule, used for the CMake build/test scaffolding)
+- vernier
 
+All of these are expected from a Spack environment: `spack-envs/llnl/`
+contains Spack environments for supported systems (Dane, Tioga, Tuolumne).
 TCLAP, nlohmann/json, and vernier are located via `find_path`/`find_library`
-against `${SPACK_PREFIX}`, so point `SPACK_PREFIX` (or your compiler's default
-search paths) at an environment providing them. `spack-envs/llnl/` contains
-example Spack environments for LLNL systems (Dane, Tioga, Tuolumne).
+against `${SPACK_PREFIX}`, so point `SPACK_PREFIX` at the environment's view
+(or your compiler's default search paths) when configuring.
 
 ## Building
-
-This repository uses git submodules (`blt`, `tclap`). Clone with:
-
-```bash
-git clone --recurse-submodules <repo-url>
-```
-
-or, if already cloned:
-
-```bash
-git submodule update --init --recursive
-```
-
-Then configure and build with CMake, pointing at your MPI_Advance and NuMesh
-installs:
 
 ```bash
 mkdir build && cd build
 cmake -DMPI_Advance_PREFIX=/path/to/mpi_advance \
       -DNuMesh_PREFIX=/path/to/numesh \
+      -DSPACK_PREFIX=/path/to/spack/env/view \
       ..
 make
 ```
-
-See `run_cmake.sh` for an example invocation.
 
 ## Usage
 
@@ -115,10 +100,8 @@ value) and normalized into a probability distribution before sampling.
   (`cli.*`), pattern loading (`pattern.*`), sampling (`sampling.*`), and
   the benchmark loop (`benchmark.*`); options shared across those are in
   `options.*`
-- `tests/` - unit tests (via BLT + GoogleTest)
 - `cmake/` - project-local CMake find modules
 - `spack-envs/` - Spack environment files for supported systems
-- `blt/`, `tclap/` - vendored dependencies (git submodules)
 
 ## Contributing
 

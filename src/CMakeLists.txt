@@ -15,10 +15,7 @@ set(HEADERS
     benchmark.hpp
     )
 
-blt_add_executable( NAME irregular-benchmarking
-        SOURCES ${SOURCES}
-        HEADERS ${HEADERS}
-        OUTPUT_DIR ${EXAMPLE_OUTPUT_DIRECTORY})
+add_executable( irregular-benchmarking ${SOURCES} ${HEADERS} )
 
 target_link_libraries( irregular-benchmarking
         Cabana::Core
