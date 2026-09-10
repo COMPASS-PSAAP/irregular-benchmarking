@@ -3,7 +3,7 @@
 Benchmarking and test harness for irregular, sparse MPI communication
 patterns, built on [Cabana](https://github.com/ECP-copa/Cabana) and
 [Kokkos](https://github.com/kokkos/kokkos), with support for locality-aware
-MPI extensions (MPI_Advance), NuMesh, and split-communicator strategies for
+MPI extensions (MPI_Advance) and split-communicator strategies for
 reducing per-rank memory overhead.
 
 ## Dependencies
@@ -13,7 +13,6 @@ reducing per-rank memory overhead.
 - [Cabana](https://github.com/ECP-copa/Cabana) (built with MPI and Grid/Cajita support)
 - Kokkos (via Cabana)
 - MPI_Advance
-- NuMesh
 - [TCLAP](https://github.com/mirror/tclap)
 - [nlohmann/json](https://github.com/nlohmann/json)
 - vernier
@@ -29,7 +28,6 @@ against `${SPACK_PREFIX}`, so point `SPACK_PREFIX` at the environment's view
 ```bash
 mkdir build && cd build
 cmake -DMPI_Advance_PREFIX=/path/to/mpi_advance \
-      -DNuMesh_PREFIX=/path/to/numesh \
       -DSPACK_PREFIX=/path/to/spack/env/view \
       ..
 make
