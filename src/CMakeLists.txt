@@ -1,19 +1,115 @@
-set(DEPENDS_ON
-  Cabana::Core
-  Cabana::Grid
-  MPI::MPI_CXX
-  )
- 
-set(INCLUDES
-    ${CMAKE_CURRENT_SOURCE_DIR}
-    ${CMAKE_CURRENT_BINARY_DIR}
-  )
-       
-add_library( irregular-benchmarking INTERFACE ${SOURCES} )
-target_link_libraries( irregular-benchmarking INTERFACE ${DEPENDS_ON} )
-target_include_directories( irregular-benchmarking INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}
-	  $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
-	  $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}> )
+set(SOURCES
+    main.cpp
+    cli.cpp
+    options.cpp
+    pattern.cpp
+    sampling.cpp
+    benchmark.cpp
+    )
 
-install(FILES ${HEADERS} DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
-install(TARGETS irregular-benchmarking LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR} ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+set(HEADERS
+    cli.hpp
+    options.hpp
+    pattern.hpp
+    sampling.hpp
+    benchmark.hpp
+    )
+
+blt_add_executable( NAME irregular-benchmarking
+        SOURCES ${SOURCES}
+        HEADERS ${HEADERS}
+        OUTPUT_DIR ${EXAMPLE_OUTPUT_DIRECTORY})
+
+target_link_libraries( irregular-benchmarking
+        Cabana::Core
+        Cabana::Grid
+        MPI::MPI_CXX
+        )
+
+#
+##CALIPER_start
+#find_path(CALIPER_INCLUDE_DIR caliper/cali.h
+#        PATHS
+#        ${SPACK_PREFIX}/include
+#)
+#
+#find_library(CALIPER_LIBRARY caliper
+#        PATHS
+#        ${SPACK_PREFIX}/lib
+#)
+#
+## Check if we found Caliper
+#if (CALIPER_INCLUDE_DIR AND CALIPER_LIBRARY)
+#    message(STATUS "Found Caliper: ${CALIPER_LIBRARY}")
+#    set(CALIPER_FOUND TRUE)
+#else ()
+#    message(FATAL_ERROR "Caliper not found!")
+#endif ()
+#
+#set(CALIPER_INCLUDE_DIRS ${CALIPER_INCLUDE_DIR})
+#set(CALIPER_LIBRARIES ${CALIPER_LIBRARY})
+#
+#include_directories(${CALIPER_INCLUDE_DIR})
+##CALIPER_end
+#
+
+#TCLAP_start
+find_path(TCLAP_INCLUDE_DIR tclap/CmdLine.h
+        PATHS
+        ${SPACK_PREFIX}/include
+)
+
+# Check if we found TCLAP
+if (TCLAP_INCLUDE_DIR)
+    message(STATUS "Found TCLAP: ${TCLAP_INCLUDE_DIR}")
+    set(TCLAP_FOUND TRUE)
+else ()
+    message(FATAL_ERROR "TCLAP not found!")
+endif ()
+set(TCLAP_INCLUDE_DIRS ${TCLAP_INCLUDE_DIR})
+
+include_directories(${TCLAP_INCLUDE_DIR})
+#TCLAP_end
+
+# nlohmann_json_start
+find_path(NLOHMANN_JSON_INCLUDE_DIR nlohmann/json.hpp
+        PATHS
+        ${SPACK_PREFIX}/include
+)
+
+# Check if we found nlohmann/json
+if (NLOHMANN_JSON_INCLUDE_DIR)
+    message(STATUS "Found nlohmann/json: ${NLOHMANN_JSON_INCLUDE_DIR}")
+    set(NLOHMANN_JSON_FOUND TRUE)
+else ()
+    message(FATAL_ERROR "nlohmann/json not found!")
+endif ()
+set(NLOHMANN_JSON_INCLUDE_DIRS ${NLOHMANN_JSON_INCLUDE_DIR})
+
+include_directories(${NLOHMANN_JSON_INCLUDE_DIR})
+# nlohmann_json_end
+
+#
+#find_package(MPI REQUIRED)
+#find_package(vernier REQUIRED)
+#target_link_libraries( irregular-benchmarking vernier::vernier )
+
+# vernier_start
+find_library(VERNIER_LIBRARY vernier
+        PATHS
+        ${SPACK_PREFIX}/lib
+)
+
+if (VERNIER_LIBRARY)
+    message(STATUS "Found vernier: ${VERNIER_LIBRARY}")
+    set(VERNIER_FOUND TRUE)
+else ()
+    message(FATAL_ERROR "vernier not found!")
+endif ()
+# vernier_end
+
+target_link_libraries( irregular-benchmarking ${VERNIER_LIBRARY})
+
+#target_link_libraries( irregular-benchmarking PRIVATE ${CALIPER_LIBRARY} )
+
+install(TARGETS irregular-benchmarking DESTINATION ${CMAKE_INSTALL_BINDIR})

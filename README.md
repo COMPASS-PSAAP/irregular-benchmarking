@@ -52,8 +52,10 @@ See `run_cmake.sh` for an example invocation.
 
 ## Layout
 
-- `src/` - core library code
-- `examples/` - example/benchmark drivers
+- `src/` - benchmark source: `main.cpp` wires together CLI parsing
+  (`cli.*`), pattern loading (`pattern.*`), sampling (`sampling.*`), and
+  the benchmark loop (`benchmark.*`); options shared across those are in
+  `options.*`
 - `tests/` - unit tests (via BLT + GoogleTest)
 - `cmake/` - project-local CMake find modules
 - `spack-envs/` - Spack environment files for supported systems
