@@ -1,16 +1,20 @@
 # irregular-benchmarking
 
 Benchmarking and test harness for irregular, sparse MPI communication
-patterns, built on [Cabana](https://github.com/ECP-copa/Cabana) and
-[Kokkos](https://github.com/kokkos/kokkos), with support for locality-aware
-MPI extensions (MPI_Advance) and split-communicator strategies for
-reducing per-rank memory overhead.
+patterns, built on [Cabana](https://github.com/CUP-ECS/Cabana/tree/mpiadvane-commspace-restructure)
+and [Kokkos](https://github.com/kokkos/kokkos), with support for
+locality-aware MPI extensions (MPI_Advance) and split-communicator
+strategies for reducing per-rank memory overhead.
 
 ## Dependencies
 
 - CMake >= 3.18
 - MPI
-- [Cabana](https://github.com/ECP-copa/Cabana) (built with MPI, Grid/Cajita, and locality-aware support)
+- [Cabana](https://github.com/CUP-ECS/Cabana/tree/mpiadvane-commspace-restructure)
+  (the CUP-ECS fork, `mpiadvane-commspace-restructure` branch - stock
+  [ECP-copa/Cabana](https://github.com/ECP-copa/Cabana) doesn't have
+  locality-aware support; built with MPI, Grid/Cajita, and
+  locality-aware support)
 - Kokkos (via Cabana)
 - [locality_aware](https://github.com/mpi-advance/locality_aware) (a.k.a. MPI_Advance; provides the locality-aware MPI extensions used for halo exchange)
 - [TCLAP](https://github.com/mirror/tclap)
@@ -26,6 +30,12 @@ placeholders). It pulls `cabana` (with the `+locality_aware` variant) and
 ([CUP-ECS/spack-packages](https://github.com/CUP-ECS/spack-packages),
 `cabana-locality-aware` branch), plus `tclap`, `nlohmann-json`, and
 `caliper` from builtin Spack.
+
+The `cabana` package's `git` URL is CUP-ECS/Cabana, and its `master`
+branch is unrelated to (260 commits ahead, 65 behind) the
+`mpiadvane-commspace-restructure` branch this project actually needs -
+double check the environment's `cabana` spec/`develop:` override points
+at `mpiadvane-commspace-restructure`, not `master`.
 
 **Vernier has no Spack package** (it's a private repo, not in builtin
 Spack or the CUP-ECS repo above), so it isn't in `spack.yaml` and must be
