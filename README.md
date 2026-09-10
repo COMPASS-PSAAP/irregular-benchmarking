@@ -15,7 +15,7 @@ reducing per-rank memory overhead.
 - [locality_aware](https://github.com/mpi-advance/locality_aware) (a.k.a. MPI_Advance; provides the locality-aware MPI extensions used for halo exchange)
 - [TCLAP](https://github.com/mirror/tclap)
 - [nlohmann/json](https://github.com/nlohmann/json)
-- [Vernier](https://github.com/MetOffice/Vernier) (profiling; depends on Caliper)
+- [Vernier](https://github.com/JDTruj2018/Vernier) (profiling; private repo)
 
 ### Spack environment
 
@@ -27,11 +27,11 @@ placeholders). It pulls `cabana` (with the `+locality_aware` variant) and
 `cabana-locality-aware` branch), plus `tclap`, `nlohmann-json`, and
 `caliper` from builtin Spack.
 
-**Vernier has no Spack package** (checked both builtin Spack and the
-CUP-ECS repo above), so it isn't in `spack.yaml` and must be built and
-installed separately; point `SPACK_PREFIX`/`VERNIER_PREFIX`-equivalent
-paths at wherever you install it (see `find_library(VERNIER_LIBRARY ...)`
-in `src/CMakeLists.txt`).
+**Vernier has no Spack package** (it's a private repo, not in builtin
+Spack or the CUP-ECS repo above), so it isn't in `spack.yaml` and must be
+built and installed separately; point `SPACK_PREFIX` (or wherever else
+`find_library(VERNIER_LIBRARY ...)` in `src/CMakeLists.txt` looks) at
+wherever you install it.
 
 To build the environment:
 

@@ -2,10 +2,13 @@
 set(MPI_Advance_PREFIX "${CMAKE_INSTALL_PREFIX}" CACHE STRING "Help cmake to find MPI_Advance")
 
 # check include
-find_path(MPI_Advance_INCLUDE_DIR NAMES mpi_advance.h HINTS ${MPI_Advance_PREFIX}/include)
+# NOTE: MPI_Advance was renamed to locality_aware upstream
+# (https://github.com/mpi-advance/locality_aware); the installed header
+# and library kept the new name.
+find_path(MPI_Advance_INCLUDE_DIR NAMES locality_aware.h HINTS ${MPI_Advance_PREFIX}/include)
 
 # check lib
-find_library(MPI_Advance_LIBRARY NAMES mpi_advance
+find_library(MPI_Advance_LIBRARY NAMES locality_aware
 	HINTS ${MPI_Advance_PREFIX}/lib)
 
 # setup found
