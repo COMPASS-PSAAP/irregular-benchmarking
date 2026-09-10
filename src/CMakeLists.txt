@@ -86,27 +86,6 @@ set(NLOHMANN_JSON_INCLUDE_DIRS ${NLOHMANN_JSON_INCLUDE_DIR})
 include_directories(${NLOHMANN_JSON_INCLUDE_DIR})
 # nlohmann_json_end
 
-#
-#find_package(MPI REQUIRED)
-#find_package(vernier REQUIRED)
-#target_link_libraries( irregular-benchmarking vernier::vernier )
-
-# vernier_start
-find_library(VERNIER_LIBRARY vernier
-        PATHS
-        ${SPACK_PREFIX}/lib
-)
-
-if (VERNIER_LIBRARY)
-    message(STATUS "Found vernier: ${VERNIER_LIBRARY}")
-    set(VERNIER_FOUND TRUE)
-else ()
-    message(FATAL_ERROR "vernier not found!")
-endif ()
-# vernier_end
-
-target_link_libraries( irregular-benchmarking ${VERNIER_LIBRARY})
-
 #target_link_libraries( irregular-benchmarking PRIVATE ${CALIPER_LIBRARY} )
 
 install(TARGETS irregular-benchmarking DESTINATION ${CMAKE_INSTALL_BINDIR})
