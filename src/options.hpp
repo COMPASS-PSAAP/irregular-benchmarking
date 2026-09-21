@@ -19,9 +19,8 @@ enum comm_t {
     MPIS
 };
 
-// Benchmark options: populated by cli::parseArgs() (and, for
-// data_sent_max/nneighbors_max, by pattern::from_json()) and read by
-// run_benchmark().
+// Benchmark options: populated by cli::parseArgs() (and, for data_sent_max,
+// by pattern::from_json()) and read by run_benchmark().
 extern int nsamples;
 extern int niterations;
 
@@ -34,7 +33,6 @@ extern bool barrier;
 extern int seed;
 extern bool unique_seed;
 extern int data_sent_max;
-extern int nneighbors_max;
 
 // Noisy-neighbor options
 extern int nosy_percent;

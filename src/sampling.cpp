@@ -1,14 +1,16 @@
 #include "sampling.hpp"
 
-#include <chrono>
 #include <random>
 #include <vector>
 
+#include "options.hpp"
+
 namespace {
 
+// Seeded from the `seed` option, which parseArgs() has already resolved (and
+// rank-adjusted, if --unique-seed was given), so a run is reproducible.
 std::mt19937 &global_rng() {
-    static std::mt19937 rng(static_cast<unsigned long>(
-        std::chrono::system_clock::now().time_since_epoch().count()));
+    static std::mt19937 rng(static_cast<unsigned int>(seed));
     return rng;
 }
 

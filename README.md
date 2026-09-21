@@ -73,7 +73,7 @@ make
 | `-s` | `--split-type` | Communicator split: `SOCKET`\|`S`\|`s` (default), `NUMA`\|`U`\|`u`, or `NODE`\|`N`\|`n` | `SOCKET` |
 | `-a` | `--alltoallv` | Neighbor alltoallv init: `STANDARD`\|`S`\|`s` (default) or `LOCALITY`\|`L`\|`l` | `STANDARD` |
 | `-C` | `--crs` | CRS discovery method: `default`, `nonblocking`, `personalized`, `personalized_loc`, `nonblocking_loc`, `rma` | `default` |
-| `-S` | `--seed` | Seed for random sampling | none |
+| `-S` | `--seed` | Integer seed for random sampling; the same seed reproduces the same draws | current time |
 | `-q` | `--unique-seed` | Use a distinct seed per rank (`seed + rank`) | off |
 | `-b` | `--barrier` | Insert an `MPI_Barrier` between gather iterations (excluded from timing) | off |
 | `-r` | `--report-params` | Print the resolved run configuration before benchmarking | off |

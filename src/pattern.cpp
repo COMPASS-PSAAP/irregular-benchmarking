@@ -10,8 +10,6 @@ using json = nlohmann::json;
 std::map<std::string, Pattern> patterns;
 
 void from_json(const json &j, Pattern &p) {
-    int totalmessages = 0;
-
     // --- comm_partners ---
     {
         std::map<int, int> temp;
@@ -35,8 +33,6 @@ void from_json(const json &j, Pattern &p) {
         for (auto &[k, v] : temp) {
             p.comm_partners[k] = (total > 0) ? (double)v / total : 0.0;
         }
-        p.comm_partners_count = total;
-        nneighbors_max = std::max(p.comm_partners.rbegin()->first, nneighbors_max);
     }
 
     // --- buffer_size ---
@@ -71,9 +67,7 @@ void from_json(const json &j, Pattern &p) {
         std::map<int, int> temp;
 
         for (auto &[inner_k, inner_v] : inner_obj.items()) {
-            int amount = inner_v.get<int>();
-            temp[std::stoi(inner_k)] = amount;
-            totalmessages += amount / 2;
+            temp[std::stoi(inner_k)] = inner_v.get<int>();
         }
 
         double total = 0.0;
@@ -86,7 +80,4 @@ void from_json(const json &j, Pattern &p) {
 
         p.dist_to_neighbors[outer_key] = std::move(norm_inner);
     }
-
-    p.pattern_count = j.value("pattern_count", 1);
-    p.message_count = j.value("message_count", totalmessages);
 }

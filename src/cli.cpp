@@ -43,11 +43,11 @@ void parseArgs(int argc, char **argv) {
     try {
         TCLAP::CmdLine cmd("\nNOTE: TODO", ' ', "1.0");
 
-        TCLAP::ValueArg<std::string> filepathArg("f", "filepath", "Path to the BENCHMARK_CONFIG file", true, "NOFILE", "string");
+        TCLAP::ValueArg<std::string> filepathArg("f", "filepath", "Path to the BENCHMARK_CONFIG file", true, "", "string");
         TCLAP::ValueArg<int> samplesArg("I", "samples", "Number of random samples to generate", false, 25, "int");
         TCLAP::ValueArg<int> iterationsArg("i", "iterations", "Number of updates each sample performs", false, niterations, "int");
         TCLAP::ValueArg<int> seedArg("S", "seed", "Positive integer to be used as seed for random number generation", false, -1, "int");
-        TCLAP::SwitchArg useedArg("q", "unique-seed", "unique seed per rank", true);
+        TCLAP::SwitchArg useedArg("q", "unique-seed", "unique seed per rank", false);
         TCLAP::SwitchArg persistentArg("p", "persistent", "will use the persistent mpi-advance", false);
         TCLAP::SwitchArg barrierArg("b", "barrier", "uses MPI barrier between runs only measures times of MPI not the barrier itself", false);
 
@@ -96,33 +96,30 @@ void parseArgs(int argc, char **argv) {
         nosy_percent = nosyPercentArg.getValue();
         nosy_time_ms = nosyTimeArg.getValue();
 
-        if (filepath != "NOFILE") {
-            try {
-                if (filepath.empty()) {
-                    std::cerr << "Filepath is empty!" << std::endl;
-                    return;
+        if (filepath.empty()) {
+            exitError("ERROR: Filepath is empty!\n");
+        }
+
+        try {
+            std::filesystem::path p(filepath);
+
+            if (std::filesystem::exists(p)) {
+                std::ifstream file(filepath);
+                if (!file.is_open()) {
+                    exitError("Error: Could not open file. ");
                 }
 
-                std::filesystem::path p(filepath);
+                nlohmann::json j;
+                file >> j;
 
-                if (std::filesystem::exists(p)) {
-                    std::ifstream file(filepath);
-                    if (!file.is_open()) {
-                        exitError("Error: Could not open file. ");
-                    }
-
-                    nlohmann::json j;
-                    file >> j;
-
-                    for (auto &[pattern_name, pattern_json] : j.items()) {
-                        patterns[pattern_name] = pattern_json.get<Pattern>();
-                    }
-                } else {
-                    exitError("The file does not exist.");
+                for (auto &[pattern_name, pattern_json] : j.items()) {
+                    patterns[pattern_name] = pattern_json.get<Pattern>();
                 }
-            } catch (const std::exception &e) {
-                std::cerr << "Error: " << e.what() << std::endl;
+            } else {
+                exitError("The file does not exist.");
             }
+        } catch (const std::exception &e) {
+            std::cerr << "Error: " << e.what() << std::endl;
         }
         unique_seed = useedArg.getValue();
 
@@ -210,17 +207,16 @@ void parseArgs(int argc, char **argv) {
         }
 
         int seedholder = seedArg.getValue();
-        if (seed != -1 && seedholder == -1) {
-            seed = time(NULL);
-        }
+        seed = (seedholder != -1) ? seedholder : static_cast<int>(time(NULL));
+
         int comm_rank = -1;
         MPI_Comm_rank(MPI_COMM_WORLD, &comm_rank);
 
+        // Resolved in place so sample_from_map()'s RNG picks up the same seed.
         if (unique_seed) {
-            srand(seed + comm_rank);
-        } else {
-            srand(seed);
+            seed += comm_rank;
         }
+        srand(seed);
 
         if (comm_rank == 0) {
             if (reportParamsArg.getValue()) {

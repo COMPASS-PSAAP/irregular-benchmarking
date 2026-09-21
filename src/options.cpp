@@ -12,7 +12,6 @@ bool barrier = false;
 int seed = -1;
 bool unique_seed = false;
 int data_sent_max = -1;
-int nneighbors_max = -1;
 
 int nosy_percent = 0;
 int nosy_time_ms = 0;

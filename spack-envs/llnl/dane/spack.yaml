@@ -1,1 +1,29 @@
-# Spack environment for building on Dane
+spack:
+  specs:
+  - cmake@3.30.5
+  - openmpi@4.1.2
+  - kokkos +serial +openmp
+    #  - localityaware@develop
+  - cabana@master +grid +mpi +locality_aware +serial +openmp %gcc@13.3.1
+  - googletest
+  - tclap
+  - nlohmann-json
+  - caliper
+  # Modules:
+  # module load openmpi/4.1.2 gcc/13.3.1-magic cmake/3.30.5 hdf5-parallel
+  - kokkos-tools
+  - localityaware
+  repos:
+    cup-ecs:
+      git: https://github.com/CUP-ECS/spack-packages.git
+      branch: cabana-locality-aware
+  develop:
+    cabana:
+      spec: cabana@=master
+    localityaware:
+      spec: localityaware@=develop
+      #  concretizer:
+      #    unify: when_possible
+  concretizer:
+    unify: when_possible
+
