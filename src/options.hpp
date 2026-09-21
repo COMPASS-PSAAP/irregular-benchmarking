@@ -30,6 +30,7 @@ extern halo_t halo_type;
 extern comm_t comm_type;
 extern std::string crs;
 extern bool barrier;
+extern bool distinct_neighbors;
 extern int seed;
 extern bool unique_seed;
 extern int data_sent_max;

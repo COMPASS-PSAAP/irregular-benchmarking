@@ -108,14 +108,37 @@ void run_benchmark() {
             neighbors.reserve(nneighborsV);
             int numberOfmessages = nneighborsV;
 
+            // How many distinct ranks the offset distribution can actually reach.
+            // Computed with the same expression used in the loop below so the two
+            // agree, and only when the flag is on so the default path is untouched.
+            int reachable_targets = 0;
+            if (distinct_neighbors) {
+                std::set<int> reachable;
+                for (const auto &entry : pattern.dist_to_neighbors[nneighborsV]) {
+                    reachable.insert((entry.first + comm_rank + comm_size) % comm_size);
+                }
+                reachable_targets = static_cast<int>(reachable.size());
+            }
+
             for (int i = 0; i < numberOfmessages; ++i) {
                 int data_sentV = sample_from_map(pattern.buffer_size);
                 int n_export = bytes_to_elems(data_sentV);
                 total_export += n_export;
                 total_bytes += data_sentV;
 
-                int distanceToN = sample_from_map(pattern.dist_to_neighbors[nneighborsV]);
-                int node = (distanceToN + comm_rank + comm_size) % comm_size;
+                // Drawing with replacement lets a rank pick the same partner twice,
+                // so its realised partner count falls short of nneighborsV. With
+                // --distinct-neighbors we redraw instead, but only while the
+                // distribution still has an unused target, so this cannot spin.
+                const bool avoid_duplicates =
+                    distinct_neighbors
+                    && static_cast<int>(seen_neighbors.size()) < reachable_targets;
+
+                int node = -1;
+                do {
+                    int distanceToN = sample_from_map(pattern.dist_to_neighbors[nneighborsV]);
+                    node = (distanceToN + comm_rank + comm_size) % comm_size;
+                } while (avoid_duplicates && seen_neighbors.count(node) > 0);
 
                 seen_neighbors.insert(node);
                 neighbors.push_back(node);

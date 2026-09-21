@@ -76,6 +76,7 @@ make
 | `-S` | `--seed` | Integer seed for random sampling; the same seed reproduces the same draws | current time |
 | `-q` | `--unique-seed` | Use a distinct seed per rank (`seed + rank`) | off |
 | `-b` | `--barrier` | Insert an `MPI_Barrier` between gather iterations (excluded from timing) | off |
+| `-U` | `--distinct-neighbors` | Draw each rank's neighbors without replacement, so a rank never draws the same partner twice | off |
 | `-r` | `--report-params` | Print the resolved run configuration before benchmarking | off |
 | `-N` | `--nosy-percent` | Percent chance (0-100) a rank sleeps before each gather, simulating a noisy neighbor | `0` |
 | `-T` | `--nosy-time` | Sleep duration in ms when acting as a noisy neighbor | `0` |
@@ -87,6 +88,12 @@ placement from that pattern's distributions, builds a `Cabana::Halo`, and
 times `--iterations` gather calls. Min/max/average timings (halo
 construction, AoSoA resize, gather setup, gather apply) are reduced across
 ranks and printed on rank 0.
+
+Neighbor placement is drawn with replacement by default, so a rank can draw
+the same partner twice and its realised partner count then falls short of the
+neighbor count it drew. `--distinct-neighbors` redraws on a collision instead,
+which makes the realised count match the drawn one; it stops redrawing once
+the offset distribution has no unused target left, so it cannot spin.
 
 ### Pattern config format
 

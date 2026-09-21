@@ -50,6 +50,7 @@ void parseArgs(int argc, char **argv) {
         TCLAP::SwitchArg useedArg("q", "unique-seed", "unique seed per rank", false);
         TCLAP::SwitchArg persistentArg("p", "persistent", "will use the persistent mpi-advance", false);
         TCLAP::SwitchArg barrierArg("b", "barrier", "uses MPI barrier between runs only measures times of MPI not the barrier itself", false);
+        TCLAP::SwitchArg distinctArg("U", "distinct-neighbors", "draw each rank's neighbors without replacement, so a rank never draws the same partner twice", false);
 
         TCLAP::SwitchArg reportParamsArg("r", "report-params", "Enables parameter reporting for use with analysis scripts", false);
         TCLAP::ValueArg<std::string> distributionArg("d", "distribution", "Choose from: gaussian (default), empirical or static", false, "gaussian", "string");
@@ -84,6 +85,7 @@ void parseArgs(int argc, char **argv) {
         cmd.add(CRS);
         cmd.add(persistentArg);
         cmd.add(barrierArg);
+        cmd.add(distinctArg);
         cmd.add(nosyPercentArg);
         cmd.add(nosyTimeArg);
 
@@ -92,6 +94,7 @@ void parseArgs(int argc, char **argv) {
         filepath = filepathArg.getValue();
         bool persistent = persistentArg.getValue();
         barrier = barrierArg.getValue();
+        distinct_neighbors = distinctArg.getValue();
 
         nosy_percent = nosyPercentArg.getValue();
         nosy_time_ms = nosyTimeArg.getValue();
@@ -231,6 +234,7 @@ void parseArgs(int argc, char **argv) {
                 printf("-split: %s\n", split.c_str());
                 printf("-persistent: %s\n", persistent ? "true" : "false");
                 printf("-barrier: %s\n", barrier ? "true" : "false");
+                printf("-distinct neighbors: %s\n", distinct_neighbors ? "true" : "false");
                 printf("-nosy percent: %i\n", nosy_percent);
                 printf("-nosy time (ms): %i\n", nosy_time_ms);
                 printf("------------------------------------------------------------\n");

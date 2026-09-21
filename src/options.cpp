@@ -9,6 +9,7 @@ halo_t halo_type = EXPORT;
 comm_t comm_type = MPIADVANCE;
 std::string crs = "DEFAULT";
 bool barrier = false;
+bool distinct_neighbors = false;
 int seed = -1;
 bool unique_seed = false;
 int data_sent_max = -1;
