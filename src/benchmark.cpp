@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <map>
 #include <set>
 #include <thread>
 #include <vector>
@@ -39,6 +40,7 @@ struct SampleTimings {
     double resize = -1.0;
     double gather = -1.0;
     double apply = -1.0;
+    double first_apply = -1.0;
     double nosy_count = 0.0;
 };
 
@@ -77,13 +79,108 @@ SampleTimings runSample(int num_tuple,
         }
         start = clock_type::now();
         gather.apply();
-        timings.apply += msSince(start);
+        double elapsed = msSince(start);
+        timings.apply += elapsed;
+        // The first apply can include one-time lazy setup, so report it on its own.
+        if (i == 0) {
+            timings.first_apply = elapsed;
+        }
         if (barrier) {
             MPI_Barrier(MPI_COMM_WORLD);
         }
     }
 
     return timings;
+}
+
+// Ghost values from one gather, split into the halo's own per-neighbor blocks.
+struct GhostBlocks {
+    std::vector<int> ranks;                  // source rank of each block, in plan order
+    std::vector<std::vector<double>> values; // ghosts received from that rank
+};
+
+// One gather on a fresh halo. Local values encode (rank, index) so every ghost
+// identifies which rank sent it.
+template <class BuildType, class CommSpace>
+GhostBlocks gatherGhosts(int num_tuple,
+                         const Kokkos::View<int *, MemorySpace> &export_ids,
+                         const Kokkos::View<int *, MemorySpace> &export_ranks,
+                         int comm_rank) {
+    Cabana::Halo<MemorySpace, BuildType, CommSpace> halo(MPI_COMM_WORLD, num_tuple, export_ids, export_ranks);
+    Cabana::AoSoA<DataTypes, MemorySpace, VectorLength> aosoa("verify_aosoa", halo.numLocal() + halo.numGhost());
+    auto values = Cabana::slice<0>(aosoa);
+    for (std::size_t i = 0; i < halo.numLocal(); ++i) {
+        values(i) = comm_rank * 1.0e7 + i;
+    }
+    for (std::size_t i = halo.numLocal(); i < halo.numLocal() + halo.numGhost(); ++i) {
+        values(i) = -1.0;
+    }
+    auto gather = Cabana::createGather(halo, aosoa, 1.0);
+    gather.apply();
+
+    GhostBlocks blocks;
+    std::size_t g = halo.numLocal();
+    for (int n = 0; n < halo.numNeighbor(); ++n) {
+        if (halo.numImport(n) == 0) {
+            continue;
+        }
+        blocks.ranks.push_back(halo.neighborRank(n));
+        blocks.values.emplace_back();
+        for (std::size_t k = 0; k < halo.numImport(n); ++k) {
+            blocks.values.back().push_back(values(g++));
+        }
+    }
+    return blocks;
+}
+
+// Ghosts in a block that did not come from the rank the plan assigns to it.
+int misplacedGhosts(const GhostBlocks &blocks) {
+    int misplaced = 0;
+    for (std::size_t b = 0; b < blocks.ranks.size(); ++b) {
+        for (double v : blocks.values[b]) {
+            if (static_cast<int>(v / 1.0e7) != blocks.ranks[b]) {
+                ++misplaced;
+            }
+        }
+    }
+    return misplaced;
+}
+
+// Check MPI-Advance's gather against plain MPI's for the same export lists:
+// every ghost must sit in the block of the rank that sent it, and each sender's
+// block must hold the same values in the same order as plain MPI's. The order
+// of the blocks themselves is plan-defined and reported for information only.
+template <class BuildType>
+void verifySample(const std::string &name, int num_tuple,
+                  const Kokkos::View<int *, MemorySpace> &export_ids,
+                  const Kokkos::View<int *, MemorySpace> &export_ranks,
+                  int comm_rank, int comm_size) {
+    auto expected = gatherGhosts<BuildType, Cabana::Mpi>(num_tuple, export_ids, export_ranks, comm_rank);
+    auto actual = gatherGhosts<BuildType, Cabana::LocalityAware>(num_tuple, export_ids, export_ranks, comm_rank);
+
+    std::map<int, std::vector<double>> expected_by_rank, actual_by_rank;
+    for (std::size_t b = 0; b < expected.ranks.size(); ++b) {
+        expected_by_rank[expected.ranks[b]] = expected.values[b];
+    }
+    for (std::size_t b = 0; b < actual.ranks.size(); ++b) {
+        actual_by_rank[actual.ranks[b]] = actual.values[b];
+    }
+
+    // {misplaced (MPI), misplaced (MPI-Advance), per-sender data differs, block order differs}
+    int bad[4] = {misplacedGhosts(expected) > 0 ? 1 : 0,
+                  misplacedGhosts(actual) > 0 ? 1 : 0,
+                  expected_by_rank != actual_by_rank ? 1 : 0,
+                  expected.ranks != actual.ranks ? 1 : 0};
+    int total_bad[4];
+    MPI_Reduce(bad, total_bad, 4, MPI_INT, MPI_SUM, 0, MPI_COMM_WORLD);
+    if (comm_rank == 0) {
+        bool pass = total_bad[0] == 0 && total_bad[1] == 0 && total_bad[2] == 0;
+        printf("(%s)  verify: %s (ranks with misplaced ghosts: MPI %d, MPI-Advance %d; "
+               "ranks whose per-sender data differs: %d; ranks with different block order: %d; of %d)\n",
+               name.c_str(), pass ? "PASS" : "FAIL", total_bad[0], total_bad[1], total_bad[2],
+               total_bad[3], comm_size);
+        fflush(stdout);
+    }
 }
 
 } // namespace
@@ -188,7 +285,7 @@ void run_benchmark() {
 
             double halo_gather = msSince(TIME_START_HALO);
 
-            constexpr int DATA_SIZE = 9;
+            constexpr int DATA_SIZE = 10;
             double local_vals[DATA_SIZE] = {
                 timings.halo,
                 timings.resize,
@@ -198,7 +295,8 @@ void run_benchmark() {
                 (double)nneighborsV,
                 (double)total_bytes,
                 (double)numberOfmessages,
-                timings.nosy_count
+                timings.nosy_count,
+                timings.first_apply
             };
 
             double min_vals[DATA_SIZE];
@@ -220,7 +318,8 @@ void run_benchmark() {
                     "nneighbors",
                     "data_sent",
                     "numberOfmessages",
-                    "NoseNeighbors"
+                    "NoseNeighbors",
+                    "firstApply"
                 };
 
                 printf("%-20s %-12s %-12s %-12s\n", "Metric", "Min", "Max", "Average");
@@ -232,6 +331,15 @@ void run_benchmark() {
                 }
                 printf("------------------------------------------------------------\n");
                 fflush(stdout);
+            }
+            if (comm_type == MPIADVANCE) {
+                if (verify) {
+                    if (halo_type == EXPORT) {
+                        verifySample<Cabana::Export>(name, num_tuple, export_ids, export_ranks, comm_rank, comm_size);
+                    } else {
+                        verifySample<Cabana::Import>(name, num_tuple, export_ids, export_ranks, comm_rank, comm_size);
+                    }
+                }
             }
         }
     }

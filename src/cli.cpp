@@ -50,6 +50,7 @@ void parseArgs(int argc, char **argv) {
         TCLAP::SwitchArg useedArg("q", "unique-seed", "unique seed per rank", false);
         TCLAP::SwitchArg persistentArg("p", "persistent", "will use the persistent mpi-advance", false);
         TCLAP::SwitchArg barrierArg("b", "barrier", "uses MPI barrier between runs only measures times of MPI not the barrier itself", false);
+        TCLAP::SwitchArg verifyArg("V", "verify", "after each MPI-Advance sample, gather once through plain MPI and once through MPI-Advance on the same halo and report ranks whose ghost data differ", false);
         TCLAP::SwitchArg distinctArg("U", "distinct-neighbors", "draw each rank's neighbors without replacement, so a rank never draws the same partner twice", false);
 
         TCLAP::SwitchArg reportParamsArg("r", "report-params", "Enables parameter reporting for use with analysis scripts", false);
@@ -86,6 +87,7 @@ void parseArgs(int argc, char **argv) {
         cmd.add(persistentArg);
         cmd.add(barrierArg);
         cmd.add(distinctArg);
+        cmd.add(verifyArg);
         cmd.add(nosyPercentArg);
         cmd.add(nosyTimeArg);
 
@@ -95,6 +97,7 @@ void parseArgs(int argc, char **argv) {
         bool persistent = persistentArg.getValue();
         barrier = barrierArg.getValue();
         distinct_neighbors = distinctArg.getValue();
+        verify = verifyArg.getValue();
 
         nosy_percent = nosyPercentArg.getValue();
         nosy_time_ms = nosyTimeArg.getValue();
