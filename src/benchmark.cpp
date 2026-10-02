@@ -1,12 +1,20 @@
 #include "benchmark.hpp"
 
+#include <cctype>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <map>
 #include <set>
+#include <sstream>
+#include <string>
 #include <thread>
 #include <vector>
+
+#include <sched.h>
 
 #include <Cabana_Core.hpp>
 #include <Kokkos_Core.hpp>
@@ -35,12 +43,124 @@ int bytes_to_elems(int bytes) {
     return (bytes + elem_size - 1) / elem_size;
 }
 
+// Index of the NUMA domain that holds every CPU this rank may run on, or -1 when
+// its affinity spans more than one domain (an unbound rank has no single domain).
+int boundNumaDomain() {
+    cpu_set_t mask;
+    CPU_ZERO(&mask);
+    if (sched_getaffinity(0, sizeof(mask), &mask) != 0) {
+        return -1;
+    }
+    int found = -1;
+    for (const auto &entry : std::filesystem::directory_iterator("/sys/devices/system/node")) {
+        const std::string dir = entry.path().filename().string();
+        if (dir.size() <= 4 || dir.compare(0, 4, "node") != 0 || !std::isdigit(dir[4])) {
+            continue;
+        }
+        std::ifstream file(entry.path() / "cpulist");
+        std::string list;
+        std::getline(file, list);
+        // cpulist looks like "0-55,112-167"; memory-only domains leave it empty.
+        bool overlaps = false;
+        std::stringstream ranges(list);
+        std::string range;
+        while (std::getline(ranges, range, ',')) {
+            if (range.empty()) {
+                continue;
+            }
+            const std::size_t dash = range.find('-');
+            const int lo = std::stoi(range.substr(0, dash));
+            const int hi = (dash == std::string::npos) ? lo : std::stoi(range.substr(dash + 1));
+            for (int cpu = lo; cpu <= hi && cpu < CPU_SETSIZE; ++cpu) {
+                overlaps = overlaps || CPU_ISSET(cpu, &mask);
+            }
+        }
+        if (overlaps) {
+            if (found != -1) {
+                return -1;
+            }
+            found = std::stoi(dir.substr(4));
+        }
+    }
+    return found;
+}
+
+// The node and NUMA domain of every rank in MPI_COMM_WORLD.
+struct RankPlacement {
+    std::vector<int> node;   // lowest world rank on that rank's node
+    std::vector<int> numa;   // NUMA domain index on its node, -1 if unbound
+    int unbound_ranks = 0;   // ranks with no single NUMA domain
+};
+
+RankPlacement gatherPlacement(int comm_rank, int comm_size) {
+    // Same grouping locality_aware uses for its node-local communicator.
+    MPI_Comm node_comm;
+    MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, comm_rank, MPI_INFO_NULL, &node_comm);
+    int node_id = comm_rank;
+    MPI_Bcast(&node_id, 1, MPI_INT, 0, node_comm);
+    MPI_Comm_free(&node_comm);
+
+    int mine[2] = {node_id, boundNumaDomain()};
+    std::vector<int> all(2 * comm_size);
+    MPI_Allgather(mine, 2, MPI_INT, all.data(), 2, MPI_INT, MPI_COMM_WORLD);
+
+    RankPlacement placement;
+    placement.node.resize(comm_size);
+    placement.numa.resize(comm_size);
+    for (int r = 0; r < comm_size; ++r) {
+        placement.node[r] = all[2 * r];
+        placement.numa[r] = all[2 * r + 1];
+        if (placement.numa[r] == -1) {
+            ++placement.unbound_ranks;
+        }
+    }
+    return placement;
+}
+
+// Untimed exchange of 64 B and 128 KiB messages with rank +/- d for each distance
+// d, so connections to those ranks are open before any pattern is measured. It
+// runs on a duplicate of MPI_COMM_WORLD that is freed afterwards, so nothing
+// cached on the communicator carries over into the benchmark.
+void runWarmup(warmup_t mode, int comm_rank, int comm_size) {
+    std::vector<int> distances;
+    if (mode == WARMUP_NEAREST) {
+        distances.push_back(1);
+        if (comm_size - 1 != 1) {
+            distances.push_back(comm_size - 1); // rank - 1
+        }
+    } else if (mode == WARMUP_ALL) {
+        for (int d = 1; d < comm_size; ++d) {
+            distances.push_back(d);
+        }
+    }
+    if (distances.empty()) {
+        return;
+    }
+
+    MPI_Comm comm;
+    MPI_Comm_dup(MPI_COMM_WORLD, &comm);
+    constexpr int sizes[2] = {1 << 6, 1 << 17};
+    std::vector<char> send_buf(sizes[1], 1), recv_buf(sizes[1]);
+    for (int d : distances) {
+        const int to = (comm_rank + d) % comm_size;
+        const int from = (comm_rank - d + comm_size) % comm_size;
+        for (int bytes : sizes) {
+            MPI_Request requests[2];
+            MPI_Irecv(recv_buf.data(), bytes, MPI_BYTE, from, 0, comm, &requests[0]);
+            MPI_Isend(send_buf.data(), bytes, MPI_BYTE, to, 0, comm, &requests[1]);
+            MPI_Waitall(2, requests, MPI_STATUSES_IGNORE);
+        }
+    }
+    MPI_Comm_free(&comm);
+}
+
 struct SampleTimings {
     double halo = -1.0;
     double resize = -1.0;
     double gather = -1.0;
     double apply = -1.0;
-    double first_apply = -1.0;
+    double window = -1.0; // first k applies: startup + q*k
+    double timed = -1.0;  // next n applies: q*n
     double nosy_count = 0.0;
 };
 
@@ -71,24 +191,31 @@ SampleTimings runSample(int num_tuple,
     auto gather = Cabana::createGather(halo, aosoa, 1.0);
     timings.gather = msSince(start);
 
-    timings.apply = 0.0;
-    for (int i = 0; i < niterations; i++) {
+    timings.window = 0.0;
+    timings.timed = 0.0;
+    // Halo and gather setup leave ranks out of step; start the first gather together.
+    if (barrier) {
+        MPI_Barrier(MPI_COMM_WORLD);
+    }
+    for (int i = 0; i < nwindow + ntimed; i++) {
         if (nosy_percent > 0 && (std::rand() % 100) < nosy_percent) {
             std::this_thread::sleep_for(std::chrono::milliseconds(nosy_time_ms));
             timings.nosy_count += 1.0;
         }
         start = clock_type::now();
         gather.apply();
-        double elapsed = msSince(start);
-        timings.apply += elapsed;
-        // The first apply can include one-time lazy setup, so report it on its own.
-        if (i == 0) {
-            timings.first_apply = elapsed;
-        }
         if (barrier) {
             MPI_Barrier(MPI_COMM_WORLD);
         }
+        double elapsed = msSince(start);
+        // The backend pays lazy setup in the first few applies, so they are totalled apart.
+        if (i < nwindow) {
+            timings.window += elapsed;
+        } else {
+            timings.timed += elapsed;
+        }
     }
+    timings.apply = timings.window + timings.timed;
 
     return timings;
 }
@@ -191,10 +318,29 @@ void run_benchmark() {
     int comm_size = -1;
     MPI_Comm_size(MPI_COMM_WORLD, &comm_size);
 
-    for (auto &[name, pattern] : patterns) {
+    runWarmup(warmup_mode, comm_rank, comm_size);
+
+    const RankPlacement placement = gatherPlacement(comm_rank, comm_size);
+    const bool numa_known = placement.unbound_ranks == 0;
+    if (comm_rank == 0 && !numa_known) {
+        printf("NUMA split unavailable: %d of %d ranks are not bound within one NUMA domain\n",
+               placement.unbound_ranks, comm_size);
+        fflush(stdout);
+    }
+
+    std::vector<std::string> names = selected_patterns;
+    if (names.empty()) {
+        for (const auto &[name, pattern] : patterns) {
+            names.push_back(name);
+        }
+    }
+
+    for (const std::string &name : names) {
+        Pattern &pattern = patterns.at(name);
         for (int sample_iter = 0; sample_iter < nsamples; sample_iter++) {
             std::vector<int> neighbors_data;
             std::vector<int> neighbors;
+            std::vector<int> neighbors_bytes;
             std::set<int> seen_neighbors;
             int total_export = 0;
             int total_bytes = 0;
@@ -240,6 +386,27 @@ void run_benchmark() {
                 seen_neighbors.insert(node);
                 neighbors.push_back(node);
                 neighbors_data.push_back(n_export);
+                neighbors_bytes.push_back(data_sentV);
+            }
+
+            // Where each message goes relative to this rank; a self-send counts as local.
+            double on_node_msgs = 0, off_node_msgs = 0, on_node_bytes = 0, off_node_bytes = 0;
+            double in_numa_bytes = 0, out_numa_bytes = 0;
+            for (std::size_t i = 0; i < neighbors.size(); ++i) {
+                const int partner = neighbors[i];
+                const bool same_node = placement.node[partner] == placement.node[comm_rank];
+                if (same_node) {
+                    on_node_msgs += 1;
+                    on_node_bytes += neighbors_bytes[i];
+                } else {
+                    off_node_msgs += 1;
+                    off_node_bytes += neighbors_bytes[i];
+                }
+                if (same_node && placement.numa[partner] == placement.numa[comm_rank]) {
+                    in_numa_bytes += neighbors_bytes[i];
+                } else {
+                    out_numa_bytes += neighbors_bytes[i];
+                }
             }
 
             int num_tuple = bytes_to_elems(data_sent_max);
@@ -285,7 +452,7 @@ void run_benchmark() {
 
             double halo_gather = msSince(TIME_START_HALO);
 
-            constexpr int DATA_SIZE = 10;
+            constexpr int DATA_SIZE = 17;
             double local_vals[DATA_SIZE] = {
                 timings.halo,
                 timings.resize,
@@ -296,7 +463,14 @@ void run_benchmark() {
                 (double)total_bytes,
                 (double)numberOfmessages,
                 timings.nosy_count,
-                timings.first_apply
+                timings.window,
+                timings.timed,
+                on_node_msgs,
+                off_node_msgs,
+                on_node_bytes,
+                off_node_bytes,
+                in_numa_bytes,
+                out_numa_bytes
             };
 
             double min_vals[DATA_SIZE];
@@ -319,17 +493,38 @@ void run_benchmark() {
                     "data_sent",
                     "numberOfmessages",
                     "NoseNeighbors",
-                    "firstApply"
+                    "startupWindow",
+                    "timedTotal",
+                    "onNodeNeighbors",
+                    "offNodeNeighbors",
+                    "onNodeBytes",
+                    "offNodeBytes",
+                    "inNumaBytes",
+                    "outNumaBytes"
                 };
+                constexpr int FIRST_NUMA_ROW = 15;
 
                 printf("%-20s %-12s %-12s %-12s\n", "Metric", "Min", "Max", "Average");
                 printf("------------------------------------------------------------\n");
 
                 for (int i = 0; i < DATA_SIZE; ++i) {
+                    if (i >= FIRST_NUMA_ROW && !numa_known) {
+                        continue;
+                    }
                     double avg = sum_vals[i] / comm_size;
                     printf("(%s)  %-20s %-.6f     %-.6f     %-.6f\n", name.c_str(), labels[i], min_vals[i], max_vals[i], avg);
                 }
                 printf("------------------------------------------------------------\n");
+                if (calc_budget_s > 0) {
+                    // Max over ranks, the time the application pays. All times are in ms.
+                    double y = max_vals[9];
+                    double x = max_vals[10];
+                    double q = x / ntimed;
+                    double startup = y - nwindow * q;
+                    double n_budget = std::floor((calc_budget_s * 1000.0 - startup) / q - nwindow);
+                    printf("(%s)  calc: q %.6f ms  startup %.6f ms  n %.0f  (budget %g s, k %d)\n",
+                           name.c_str(), q, startup, n_budget, calc_budget_s, nwindow);
+                }
                 fflush(stdout);
             }
             if (comm_type == MPIADVANCE) {

@@ -6,6 +6,8 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <set>
+#include <sstream>
 #include <string>
 
 #include <Cabana_Core.hpp>
@@ -45,12 +47,16 @@ void parseArgs(int argc, char **argv) {
 
         TCLAP::ValueArg<std::string> filepathArg("f", "filepath", "Path to the BENCHMARK_CONFIG file", true, "", "string");
         TCLAP::ValueArg<int> samplesArg("I", "samples", "Number of random samples to generate", false, 25, "int");
-        TCLAP::ValueArg<int> iterationsArg("i", "iterations", "Number of updates each sample performs", false, niterations, "int");
+        TCLAP::ValueArg<int> windowArg("k", "window", "Number of startup-window gathers per sample, timed as one total; these absorb the backend's lazy setup", false, nwindow, "int");
+        TCLAP::ValueArg<int> timedArg("n", "timed-iterations", "Number of gathers timed after the startup window", false, ntimed, "int");
+        TCLAP::ValueArg<double> calcArg("", "calc", "Budget in seconds; per sample, solve window = startup + q*k and timed = q*n for q and startup, and print the n that makes startup + q*(k+n) fill the budget", false, calc_budget_s, "seconds");
         TCLAP::ValueArg<int> seedArg("S", "seed", "Positive integer to be used as seed for random number generation", false, -1, "int");
         TCLAP::SwitchArg useedArg("q", "unique-seed", "unique seed per rank", false);
         TCLAP::SwitchArg persistentArg("p", "persistent", "will use the persistent mpi-advance", false);
-        TCLAP::SwitchArg barrierArg("b", "barrier", "uses MPI barrier between runs only measures times of MPI not the barrier itself", false);
+        TCLAP::SwitchArg barrierArg("b", "barrier", "time each gather barrier to barrier, so the wait for the slowest rank is included; without it ranks can drift out of sync", false);
         TCLAP::SwitchArg verifyArg("V", "verify", "after each MPI-Advance sample, gather once through plain MPI and once through MPI-Advance on the same halo and report ranks whose ghost data differ", false);
+        TCLAP::ValueArg<std::string> patternsArg("P", "patterns", "Comma-separated pattern names to run, in this order (default: every pattern in the config, in name order)", false, "", "names");
+        TCLAP::ValueArg<std::string> warmupArg("W", "warmup", "Untimed point-to-point warmup of 64 B and 128 KiB messages before any pattern: none (default), nearest (rank +/- 1) or all (every other rank)", false, "none", "mode");
         TCLAP::SwitchArg distinctArg("U", "distinct-neighbors", "draw each rank's neighbors without replacement, so a rank never draws the same partner twice", false);
 
         TCLAP::SwitchArg reportParamsArg("r", "report-params", "Enables parameter reporting for use with analysis scripts", false);
@@ -74,7 +80,9 @@ void parseArgs(int argc, char **argv) {
 
         cmd.add(filepathArg);
         cmd.add(samplesArg);
-        cmd.add(iterationsArg);
+        cmd.add(windowArg);
+        cmd.add(timedArg);
+        cmd.add(calcArg);
         cmd.add(seedArg);
         cmd.add(useedArg);
         cmd.add(distributionArg);
@@ -87,6 +95,8 @@ void parseArgs(int argc, char **argv) {
         cmd.add(persistentArg);
         cmd.add(barrierArg);
         cmd.add(distinctArg);
+        cmd.add(patternsArg);
+        cmd.add(warmupArg);
         cmd.add(verifyArg);
         cmd.add(nosyPercentArg);
         cmd.add(nosyTimeArg);
@@ -127,14 +137,47 @@ void parseArgs(int argc, char **argv) {
         } catch (const std::exception &e) {
             std::cerr << "Error: " << e.what() << std::endl;
         }
+        std::string pattern_list = patternsArg.getValue();
+        if (!pattern_list.empty()) {
+            std::stringstream names(pattern_list);
+            std::string name;
+            std::set<std::string> seen;
+            while (std::getline(names, name, ',')) {
+                if (patterns.count(name) == 0) {
+                    std::string available;
+                    for (const auto &[known, pattern] : patterns) {
+                        available += " " + known;
+                    }
+                    exitError("ERROR: Unknown pattern '" + name + "'; the config has:" + available + "\n");
+                }
+                if (!seen.insert(name).second) {
+                    exitError("ERROR: Pattern '" + name + "' is listed twice\n");
+                }
+                selected_patterns.push_back(name);
+            }
+        }
+
+        std::string warmup = warmupArg.getValue();
+        if (warmup == "none") {
+            warmup_mode = WARMUP_NONE;
+        } else if (warmup == "nearest") {
+            warmup_mode = WARMUP_NEAREST;
+        } else if (warmup == "all") {
+            warmup_mode = WARMUP_ALL;
+        } else {
+            exitError("ERROR: Invalid warmup choice [none,nearest,all]\n");
+        }
+
         unique_seed = useedArg.getValue();
 
         std::string distribution = distributionArg.getValue();
         // For nsamples, no specific range, only non-negative check
         setAndCheckValue(nsamples, samplesArg, "ERROR: Invalid number of samples\n", 0);
 
-        // For niterations, same non-negative check
-        setAndCheckValue(niterations, iterationsArg, "ERROR: Invalid number of iterations\n", 0);
+        setAndCheckValue(nwindow, windowArg, "ERROR: Invalid startup window length\n", 0);
+        // At least one timed gather, since --calc divides by n.
+        setAndCheckValue(ntimed, timedArg, "ERROR: Invalid number of timed iterations\n", 1);
+        calc_budget_s = calcArg.getValue();
 
         if (distribution == "gaussian" || distribution == "g") {
             distribution_type = GAUSSIAN;
@@ -226,12 +269,30 @@ void parseArgs(int argc, char **argv) {
 
         if (comm_rank == 0) {
             if (reportParamsArg.getValue()) {
+                char mpi_library[MPI_MAX_LIBRARY_VERSION_STRING];
+                int mpi_library_len = 0;
+                MPI_Get_library_version(mpi_library, &mpi_library_len);
+                std::string mpi_library_line(mpi_library, mpi_library_len);
+                for (char &c : mpi_library_line) {
+                    if (c == '\n') {
+                        c = ' ';
+                    }
+                }
+
                 printf("------------------------------------------------------------\n");
                 printf("-MPI: %s\n", comm.c_str());
                 printf("-halotype: %s\n", type.c_str());
                 printf("-File: %s\n", filepath.c_str());
                 printf("-samples: %i\n", nsamples);
-                printf("-iterations: %i\n", niterations);
+                printf("-patterns: %s\n", pattern_list.empty() ? "all" : pattern_list.c_str());
+                printf("-warmup: %s\n", warmup.c_str());
+                printf("-window (k): %i\n", nwindow);
+                printf("-timed iterations (n): %i\n", ntimed);
+                if (calc_budget_s > 0) {
+                    printf("-calc budget (s): %g\n", calc_budget_s);
+                } else {
+                    printf("-calc: off\n");
+                }
                 printf("-CRS: %s\n", crs.c_str());
                 printf("-alltoallv: %s\n", alltoallv.c_str());
                 printf("-split: %s\n", split.c_str());
@@ -240,6 +301,10 @@ void parseArgs(int argc, char **argv) {
                 printf("-distinct neighbors: %s\n", distinct_neighbors ? "true" : "false");
                 printf("-nosy percent: %i\n", nosy_percent);
                 printf("-nosy time (ms): %i\n", nosy_time_ms);
+                // Rank 0 added rank 0 above, so this is the base seed either way.
+                printf("-seed: %i%s\n", seed, unique_seed ? " (per rank: seed + rank)" : "");
+                printf("-MPI library: %s\n", mpi_library_line.c_str());
+                printf("-compiler: %s\n", __VERSION__);
                 printf("------------------------------------------------------------\n");
             } else {
                 printf("------------------------------------------------------------\n");
