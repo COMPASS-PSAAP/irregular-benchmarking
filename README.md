@@ -95,7 +95,14 @@ runs `k + n` gather calls. Min/max/average timings (halo construction, AoSoA
 resize, gather setup, gather apply) are reduced across ranks and printed on
 rank 0. The backend pays lazy setup in its first few applies, so the first
 `k` are totalled as `startupWindow` (startup + q·k) and the next `n` as
-`timedTotal` (q·n), where q is the steady-state time per gather.
+`timedTotal` (q·n), where q is the steady-state time per gather. With
+`--barrier`, each gather is timed from the end of the previous barrier
+through the apply and the barrier after it, so these totals include the wait
+for the slowest rank. `windowApplyOnly` and `timedApplyOnly` are the same two
+totals with each gather's timer stopped before its barrier: this rank's apply
+alone. Their Max column is the largest per-rank total, not the sum of each
+gather's slowest apply. The barrier still keeps ranks in step. Without
+`--barrier` the two pairs are equal.
 
 With `--calc <seconds>`, rank 0 also solves those two equations from the
 max-over-ranks totals for q and startup, and prints the `n` for which

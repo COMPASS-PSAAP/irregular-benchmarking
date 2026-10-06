@@ -162,6 +162,9 @@ struct SampleTimings {
     double apply = -1.0;
     double window = -1.0; // first k applies: startup + q*k
     double timed = -1.0;  // next n applies: q*n
+    // The same two totals stopped before the -b barrier: this rank's apply alone.
+    double window_apply = -1.0;
+    double timed_apply = -1.0;
     double nosy_count = 0.0;
 };
 
@@ -194,6 +197,8 @@ SampleTimings runSample(int num_tuple,
 
     timings.window = 0.0;
     timings.timed = 0.0;
+    timings.window_apply = 0.0;
+    timings.timed_apply = 0.0;
     // Halo and gather setup leave ranks out of step; start the first gather together.
     if (barrier) {
         MPI_Barrier(MPI_COMM_WORLD);
@@ -205,6 +210,7 @@ SampleTimings runSample(int num_tuple,
         }
         start = clock_type::now();
         gather.apply();
+        double apply_only = msSince(start);
         if (barrier) {
             MPI_Barrier(MPI_COMM_WORLD);
         }
@@ -212,8 +218,10 @@ SampleTimings runSample(int num_tuple,
         // The backend pays lazy setup in the first few applies, so they are totalled apart.
         if (i < nwindow) {
             timings.window += elapsed;
+            timings.window_apply += apply_only;
         } else {
             timings.timed += elapsed;
+            timings.timed_apply += apply_only;
         }
     }
     timings.apply = timings.window + timings.timed;
@@ -493,7 +501,7 @@ void run_benchmark() {
 
             double halo_gather = msSince(TIME_START_HALO);
 
-            constexpr int DATA_SIZE = 17;
+            constexpr int DATA_SIZE = 19;
             double local_vals[DATA_SIZE] = {
                 timings.halo,
                 timings.resize,
@@ -506,6 +514,8 @@ void run_benchmark() {
                 timings.nosy_count,
                 timings.window,
                 timings.timed,
+                timings.window_apply,
+                timings.timed_apply,
                 on_node_msgs,
                 off_node_msgs,
                 on_node_bytes,
@@ -536,6 +546,8 @@ void run_benchmark() {
                     "NoseNeighbors",
                     "startupWindow",
                     "timedTotal",
+                    "windowApplyOnly",
+                    "timedApplyOnly",
                     "onNodeNeighbors",
                     "offNodeNeighbors",
                     "onNodeBytes",
@@ -543,7 +555,7 @@ void run_benchmark() {
                     "inNumaBytes",
                     "outNumaBytes"
                 };
-                constexpr int FIRST_NUMA_ROW = 15;
+                constexpr int FIRST_NUMA_ROW = 17;
 
                 printf("%-20s %-12s %-12s %-12s\n", "Metric", "Min", "Max", "Average");
                 printf("------------------------------------------------------------\n");
