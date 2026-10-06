@@ -1,7 +1,10 @@
 #!/bin/bash
 # Record a launch's provenance. Run it inside the sbatch job, before the benchmark:
 #
-#   scripts/provenance.sh OUTDIR BINARY CONFIG [-- SRUN_ARGS...]
+#   scripts/provenance.sh OUTDIR BINARY INPUTS [-- SRUN_ARGS...]
+#
+# INPUTS is one input file (JSON pattern config or .pm matrix) or several,
+# comma-separated.
 #
 # SRUN_ARGS must be the geometry the benchmark's srun uses (e.g. --nodes=2
 # --ntasks-per-node=112), because binding is read from a separate srun step and
@@ -16,12 +19,12 @@
 set -u
 
 if [ $# -lt 3 ]; then
-    echo "usage: $0 OUTDIR BINARY CONFIG [-- SRUN_ARGS...]" >&2
+    echo "usage: $0 OUTDIR BINARY INPUTS [-- SRUN_ARGS...]" >&2
     exit 1
 fi
 outdir=$1
 bin=$(readlink -f "$2")
-config=$(readlink -f "$3")
+inputs=$3  # one input file, or several comma-separated
 shift 3
 if [ "${1:-}" = "--" ]; then
     shift
@@ -34,6 +37,13 @@ out=$base.txt
 mkdir -p "$outdir"
 
 section() { printf '\n== %s\n' "$1"; }
+
+# True only when $1 is the top of its own git checkout. A plain directory inside
+# some other repository (e.g. a git-archive export under a home directory that is
+# itself a repo) must not be reported as that repository.
+is_checkout() {
+    [ -n "$1" ] && [ "$(git -C "$1" rev-parse --show-toplevel 2>/dev/null)" = "$(readlink -f "$1")" ]
+}
 
 {
     section "job"
@@ -101,7 +111,7 @@ section() { printf '\n== %s\n' "$1"; }
     fi
 
     section "benchmark source"
-    if [ -n "$src" ] && git -C "$src" rev-parse --git-dir > /dev/null 2>&1; then
+    if is_checkout "$src"; then
         echo "source: $src"
         echo "commit: $(git -C "$src" rev-parse HEAD)"
         echo "branch: $(git -C "$src" rev-parse --abbrev-ref HEAD)"
@@ -132,7 +142,7 @@ section() { printf '\n== %s\n' "$1"; }
         # install (see its dirty state) does not describe it.
         for pkg in localityaware cabana; do
             dev=$PROV_SPACK_ENV/$pkg
-            if git -C "$dev" rev-parse --git-dir > /dev/null 2>&1; then
+            if is_checkout "$dev"; then
                 echo "$pkg dev checkout: $dev $(git -C "$dev" rev-parse HEAD) ($(git -C "$dev" rev-parse --abbrev-ref HEAD), $(git -C "$dev" status --porcelain | wc -l) changed files)"
             fi
         done
@@ -140,12 +150,16 @@ section() { printf '\n== %s\n' "$1"; }
         echo "PROV_SPACK_ENV not set; skipped"
     fi
 
-    section "pattern config"
-    echo "config: $config"
-    echo "config sha256: $(sha256sum "$config" | cut -d' ' -f1)"
-    echo "config mtime: $(date -Iseconds -r "$config")"
-    echo "patterns: $(python3 "$script_dir/pattern-names.py" "$config" | tr '\n' ' ')"
-    echo "vernier commit: not recorded in the config"
+    section "inputs"
+    IFS=, read -ra input_files <<< "$inputs"
+    for f in "${input_files[@]}"; do
+        f=$(readlink -f "$f")
+        echo "input: $f"
+        echo "  sha256: $(sha256sum "$f" | cut -d' ' -f1)"
+        echo "  mtime: $(date -Iseconds -r "$f")"
+        echo "  patterns: $(python3 "$script_dir/pattern-names.py" "$f" | tr '\n' ' ')"
+    done
+    echo "vernier commit: not recorded in the inputs"
 
     section "environment"
     env | grep -E '^(SLURM_|OMPI_|PMIX_|PMI_|PSM2_|HFI_|FI_|UCX_|OMP_|KOKKOS_|MPIL_)|^(LD_LIBRARY_PATH|LD_PRELOAD|PATH)=' | sort

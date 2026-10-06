@@ -3,6 +3,7 @@ set(SOURCES
     cli.cpp
     options.cpp
     pattern.cpp
+    matrix.cpp
     sampling.cpp
     benchmark.cpp
     )
@@ -11,6 +12,7 @@ set(HEADERS
     cli.hpp
     options.hpp
     pattern.hpp
+    matrix.hpp
     sampling.hpp
     benchmark.hpp
     )

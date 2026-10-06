@@ -19,6 +19,7 @@
 #include <Cabana_Core.hpp>
 #include <Kokkos_Core.hpp>
 
+#include "matrix.hpp"
 #include "options.hpp"
 #include "pattern.hpp"
 #include "sampling.hpp"
@@ -310,6 +311,98 @@ void verifySample(const std::string &name, int num_tuple,
     }
 }
 
+// One sample's halo lists, plus the partner rank and size in bytes of each message.
+struct SampleLists {
+    int num_tuple = 0;            // elements each rank owns
+    std::vector<int> ids, ranks;  // one entry per element in the halo's lists
+    std::vector<int> partners;    // one entry per message
+    std::vector<int> partner_bytes;
+    int drawn_neighbors = 0;      // reported as nneighbors
+};
+
+// Draws one sample from a JSON pattern's distributions.
+SampleLists sampledLists(Pattern &pattern, int comm_rank, int comm_size) {
+    std::vector<int> neighbors_data;
+    std::vector<int> neighbors;
+    std::vector<int> neighbors_bytes;
+    std::set<int> seen_neighbors;
+
+    int nneighborsV = sample_from_map(pattern.comm_partners);
+
+    neighbors_data.reserve(nneighborsV);
+    neighbors.reserve(nneighborsV);
+    int numberOfmessages = nneighborsV;
+
+    // How many distinct ranks the offset distribution can actually reach.
+    // Computed with the same expression used in the loop below so the two
+    // agree, and only when the flag is on so the default path is untouched.
+    int reachable_targets = 0;
+    if (distinct_neighbors) {
+        std::set<int> reachable;
+        for (const auto &entry : pattern.dist_to_neighbors[nneighborsV]) {
+            reachable.insert((entry.first + comm_rank + comm_size) % comm_size);
+        }
+        reachable_targets = static_cast<int>(reachable.size());
+    }
+
+    for (int i = 0; i < numberOfmessages; ++i) {
+        int data_sentV = sample_from_map(pattern.buffer_size);
+        int n_export = bytes_to_elems(data_sentV);
+
+        // Drawing with replacement lets a rank pick the same partner twice,
+        // so its realised partner count falls short of nneighborsV. With
+        // --distinct-neighbors we redraw instead, but only while the
+        // distribution still has an unused target, so this cannot spin.
+        const bool avoid_duplicates =
+            distinct_neighbors
+            && static_cast<int>(seen_neighbors.size()) < reachable_targets;
+
+        int node = -1;
+        do {
+            int distanceToN = sample_from_map(pattern.dist_to_neighbors[nneighborsV]);
+            node = (distanceToN + comm_rank + comm_size) % comm_size;
+        } while (avoid_duplicates && seen_neighbors.count(node) > 0);
+
+        seen_neighbors.insert(node);
+        neighbors.push_back(node);
+        neighbors_data.push_back(n_export);
+        neighbors_bytes.push_back(data_sentV);
+    }
+
+    SampleLists lists;
+    lists.num_tuple = bytes_to_elems(data_sent_max);
+    for (std::size_t m = 0; m < neighbors.size(); ++m) {
+        for (int i = 0; i < neighbors_data[m]; ++i) {
+            lists.ids.push_back(i);
+            lists.ranks.push_back(neighbors[m]);
+        }
+    }
+    lists.partners = neighbors;
+    lists.partner_bytes = neighbors_bytes;
+    lists.drawn_neighbors = nneighborsV;
+    return lists;
+}
+
+// The matrix's SpMV halo, the same for every sample: one double per x entry.
+// For IMPORT the lists name what this rank receives, so the per-message rows
+// then describe incoming messages.
+SampleLists matrixLists(halo_t type) {
+    SampleLists lists;
+    lists.num_tuple = matrix_halo.local_cols;
+    lists.ids = (type == EXPORT) ? matrix_halo.export_ids : matrix_halo.import_ids;
+    lists.ranks = (type == EXPORT) ? matrix_halo.export_ranks : matrix_halo.import_ranks;
+    // Both lists are grouped by partner rank, so each run of one rank is one message.
+    for (std::size_t i = 0; i < lists.ranks.size(); ++i) {
+        if (i == 0 || lists.ranks[i] != lists.ranks[i - 1]) {
+            lists.partners.push_back(lists.ranks[i]);
+            lists.partner_bytes.push_back(0);
+        }
+        lists.partner_bytes.back() += static_cast<int>(sizeof(cabana_datatype));
+    }
+    lists.drawn_neighbors = static_cast<int>(lists.partners.size());
+    return lists;
+}
+
 } // namespace
 
 void run_benchmark() {
@@ -330,106 +423,54 @@ void run_benchmark() {
 
     std::vector<std::string> names = selected_patterns;
     if (names.empty()) {
-        for (const auto &[name, pattern] : patterns) {
-            names.push_back(name);
+        if (matrix_input) {
+            names.push_back(matrix_halo.name);
+        } else {
+            for (const auto &[name, pattern] : patterns) {
+                names.push_back(name);
+            }
         }
     }
 
     for (const std::string &name : names) {
-        Pattern &pattern = patterns.at(name);
         for (int sample_iter = 0; sample_iter < nsamples; sample_iter++) {
-            std::vector<int> neighbors_data;
-            std::vector<int> neighbors;
-            std::vector<int> neighbors_bytes;
-            std::set<int> seen_neighbors;
-            int total_export = 0;
-            int total_bytes = 0;
-
-            int nneighborsV = sample_from_map(pattern.comm_partners);
-
-            neighbors_data.reserve(nneighborsV);
-            neighbors.reserve(nneighborsV);
-            int numberOfmessages = nneighborsV;
-
-            // How many distinct ranks the offset distribution can actually reach.
-            // Computed with the same expression used in the loop below so the two
-            // agree, and only when the flag is on so the default path is untouched.
-            int reachable_targets = 0;
-            if (distinct_neighbors) {
-                std::set<int> reachable;
-                for (const auto &entry : pattern.dist_to_neighbors[nneighborsV]) {
-                    reachable.insert((entry.first + comm_rank + comm_size) % comm_size);
-                }
-                reachable_targets = static_cast<int>(reachable.size());
-            }
-
-            for (int i = 0; i < numberOfmessages; ++i) {
-                int data_sentV = sample_from_map(pattern.buffer_size);
-                int n_export = bytes_to_elems(data_sentV);
-                total_export += n_export;
-                total_bytes += data_sentV;
-
-                // Drawing with replacement lets a rank pick the same partner twice,
-                // so its realised partner count falls short of nneighborsV. With
-                // --distinct-neighbors we redraw instead, but only while the
-                // distribution still has an unused target, so this cannot spin.
-                const bool avoid_duplicates =
-                    distinct_neighbors
-                    && static_cast<int>(seen_neighbors.size()) < reachable_targets;
-
-                int node = -1;
-                do {
-                    int distanceToN = sample_from_map(pattern.dist_to_neighbors[nneighborsV]);
-                    node = (distanceToN + comm_rank + comm_size) % comm_size;
-                } while (avoid_duplicates && seen_neighbors.count(node) > 0);
-
-                seen_neighbors.insert(node);
-                neighbors.push_back(node);
-                neighbors_data.push_back(n_export);
-                neighbors_bytes.push_back(data_sentV);
+            const SampleLists lists = matrix_input
+                                          ? matrixLists(halo_type)
+                                          : sampledLists(patterns.at(name), comm_rank, comm_size);
+            const int nneighborsV = lists.drawn_neighbors;
+            const int numberOfmessages = static_cast<int>(lists.partners.size());
+            long total_bytes = 0;
+            for (int bytes : lists.partner_bytes) {
+                total_bytes += bytes;
             }
 
             // Where each message goes relative to this rank; a self-send counts as local.
             double on_node_msgs = 0, off_node_msgs = 0, on_node_bytes = 0, off_node_bytes = 0;
             double in_numa_bytes = 0, out_numa_bytes = 0;
-            for (std::size_t i = 0; i < neighbors.size(); ++i) {
-                const int partner = neighbors[i];
+            for (std::size_t i = 0; i < lists.partners.size(); ++i) {
+                const int partner = lists.partners[i];
                 const bool same_node = placement.node[partner] == placement.node[comm_rank];
                 if (same_node) {
                     on_node_msgs += 1;
-                    on_node_bytes += neighbors_bytes[i];
+                    on_node_bytes += lists.partner_bytes[i];
                 } else {
                     off_node_msgs += 1;
-                    off_node_bytes += neighbors_bytes[i];
+                    off_node_bytes += lists.partner_bytes[i];
                 }
                 if (same_node && placement.numa[partner] == placement.numa[comm_rank]) {
-                    in_numa_bytes += neighbors_bytes[i];
+                    in_numa_bytes += lists.partner_bytes[i];
                 } else {
-                    out_numa_bytes += neighbors_bytes[i];
+                    out_numa_bytes += lists.partner_bytes[i];
                 }
             }
 
-            int num_tuple = bytes_to_elems(data_sent_max);
-
+            const int num_tuple = lists.num_tuple;
+            const int total_export = static_cast<int>(lists.ids.size());
             Kokkos::View<int *, MemorySpace> export_ranks("export_ranks", total_export);
             Kokkos::View<int *, MemorySpace> export_ids("export_ids", total_export);
-
             for (int i = 0; i < total_export; ++i) {
-                export_ids(i) = -1;
-                export_ranks(i) = -1;
-            }
-
-            int inum = 0;
-            auto it_data = neighbors_data.begin();
-            auto it_neighbors = neighbors.begin();
-
-            while (it_data != neighbors_data.end() && it_neighbors != neighbors.end()) {
-                for (int i = 0; i < *it_data; ++i) {
-                    export_ids(inum) = i;
-                    export_ranks(inum++) = *it_neighbors;
-                }
-                ++it_data;
-                ++it_neighbors;
+                export_ids(i) = lists.ids[i];
+                export_ranks(i) = lists.ranks[i];
             }
 
             auto TIME_START_HALO = clock_type::now();

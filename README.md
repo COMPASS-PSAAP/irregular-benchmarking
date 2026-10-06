@@ -61,11 +61,12 @@ make
 
 ```bash
 ./irregular-benchmarking --filepath pattern_config.json [options]
+./irregular-benchmarking --filepath matrix.pm [options]
 ```
 
 | Flag | Long form | Description | Default |
 |---|---|---|---|
-| `-f` | `--filepath` | Path to the pattern config JSON file (required) | - |
+| `-f` | `--filepath` | A JSON pattern config, or a PETSc binary matrix (`.pm`) whose SpMV halo is exchanged (required) | - |
 | `-I` | `--samples` | Number of random samples per pattern | `25` |
 | `-k` | `--window` | Startup-window gathers per sample, timed as one total | `10` |
 | `-n` | `--timed-iterations` | Gathers timed after the startup window (at least 1) | `1000` |
@@ -128,6 +129,32 @@ of every pattern.
 `--report-params` also prints the seed, the MPI library version, and
 the compiler version.
 
+### Matrix input
+
+Given a `.pm` file (the PETSc binary format ABCG reads; ABCG's
+`test_data/convert_petsc.py` converts SuiteSparse Matrix Market files to it),
+the benchmark exchanges that matrix's SpMV halo instead of sampling a pattern.
+Rows and the x vector are split into contiguous blocks exactly as ABCG's
+`readParMatrix` splits them, and each rank sends every x entry another rank's
+rows reference, one double each. The neighbors, message sizes, and entries are
+therefore the same as ABCG's SpMV exchange at the same rank count.
+
+- The matrix is one pattern, named after the file (`nd12k.pm` is `nd12k`), so
+  `--patterns`, the pilot, and `targets` work as for a JSON config. Nothing is
+  random, so every sample is the same exchange.
+- With `--type IMPORT` the halo is built from what each rank receives (owner
+  rank and the owner's local index), and `data_sent` and the per-message rows
+  then count incoming bytes.
+- Building the lists exchanges request counts with every rank (one
+  `MPI_Alltoall` plus an `MPI_Alltoallv`) before anything is timed, so
+  connections to most partners are already open when the first sample starts.
+- The matrix needs at least as many rows and columns as there are ranks.
+
+`-V` checks the gathered ghost data against plain MPI. On Dane, with both the
+current and the old locality_aware, EXPORT halos pass and IMPORT halos report
+differing per-sender data on every rank, for JSON patterns as well as
+matrices, so IMPORT results through MPI_Advance should not be trusted yet.
+
 ### Recording provenance
 
 `scripts/provenance.sh` records a launch's provenance from inside the sbatch
@@ -144,38 +171,46 @@ PROV_SPACK_ENV=~/spackenvs/spack-k5 scripts/provenance.sh OUTDIR build/src/irreg
     pattern_config.json -- --nodes=2 --ntasks-per-node=112
 ```
 
-`scripts/pattern-names.py CONFIG.json` prints a config's pattern names, one
-per line.
+`scripts/pattern-names.py CONFIG.json|MATRIX.pm` prints the input's pattern
+names, one per line.
 
 ### Running a campaign on Slurm
 
 Three scripts run the data collection: one pilot per node count fixes `k` and
 `n`, then any number of launches at that node count reuse them.
 
-- `scripts/pilot.sbatch NODES INPUT_FILE TARGET_SECONDS [WARMUP]` records
+- `scripts/pilot.sbatch NODES INPUTS TARGET_SECONDS [WARMUP]` records
   provenance, runs every pattern once on STANDARD with `k = 25`, `n = 100`, and
   `--calc TARGET_SECONDS`, and writes `<jobid>-pilot-<nodes>/targets` (one
   `pattern k n` line per pattern). The job fails unless every pattern gets
-  `n >= 1`.
-- `scripts/gatherdata.sbatch NODES INPUT_FILE TARGETS_FILE [WARMUP]` is one
+  `n >= 1` and no pattern name comes from two input files.
+- `scripts/gatherdata.sbatch NODES INPUTS TARGETS_FILE [WARMUP]` is one
   launch. It records provenance, copies `targets` into
   `<jobid>-gatherdata-<nodes>/`, shuffles pattern × {MPI, STANDARD, LOCALITY} ×
   `SAMPLES` with a seed it saves to `shuffle_seed` (set `SHUFFLE_SEED` to repeat
   an order), and runs one `srun` per sample with `-I 1 -b -q -r -W WARMUP`.
   `manifest.csv` gets one row per run: pattern, arm, seed, `k`, `n`, start and
   end time, and exit status.
-- `scripts/submit.sh NODES INPUT_FILE TARGET_SECONDS LAUNCHES [WARMUP]` submits
+- `scripts/submit.sh NODES INPUTS TARGET_SECONDS LAUNCHES [WARMUP]` submits
   the pilot and then `LAUNCHES` gatherdata jobs with
   `--dependency=afterok:<pilot>` and `--kill-on-invalid-dep=yes`, so the
   launches start only once the pilot has succeeded and are cancelled if it
   fails. Run it from the directory the results should go to.
 
+`INPUTS` is one input file or several, comma-separated, mixing JSON pattern
+configs and `.pm` matrices; every pattern from every file is pilot-sized and
+shuffled into each launch, and each run is given the file its pattern came from.
 `WARMUP` is the benchmark's `-W` and defaults to `nearest`. Both sbatch scripts
 take `NODES` as an argument but cannot change their allocation, so they check
 it against `sbatch -N`; `submit.sh` passes both. sbatch runs a spooled copy of
 each script, so the checkout path (`REPO`), `BINARY`, and `PROV_SPACK_ENV` are
 set at the top of `pilot.sbatch` and `gatherdata.sbatch`; edit them for your
-own checkout. For example, 40 launches at each of four node counts:
+own checkout. Both scripts also take `BINARY` and `EXTRA_ARGS` from the
+environment at submission, e.g. to run a build against another locality_aware
+with `-s NUMA`, and record both in `launch_settings`. When `BINARY` was built
+from a git archive rather than a checkout, also set `BENCH_COMMIT`, since
+provenance.sh then has no repository to read the commit from. For example, 40
+launches at each of four node counts:
 
 ```bash
 mkdir -p ~/campaign && cd ~/campaign
@@ -225,9 +260,9 @@ value) and normalized into a probability distribution before sampling.
 ## Layout
 
 - `src/` - benchmark source: `main.cpp` wires together CLI parsing
-  (`cli.*`), pattern loading (`pattern.*`), sampling (`sampling.*`), and
-  the benchmark loop (`benchmark.*`); options shared across those are in
-  `options.*`
+  (`cli.*`), pattern loading (`pattern.*`), matrix input (`matrix.*`),
+  sampling (`sampling.*`), and the benchmark loop (`benchmark.*`); options
+  shared across those are in `options.*`
 - `scripts/` - provenance recording and the Slurm campaign scripts (see
   "Running a campaign on Slurm")
 - `cmake/` - project-local CMake find modules

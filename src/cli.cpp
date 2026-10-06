@@ -13,6 +13,7 @@
 #include <Cabana_Core.hpp>
 #include <tclap/CmdLine.h>
 
+#include "matrix.hpp"
 #include "options.hpp"
 #include "pattern.hpp"
 
@@ -45,7 +46,7 @@ void parseArgs(int argc, char **argv) {
     try {
         TCLAP::CmdLine cmd("\nNOTE: TODO", ' ', "1.0");
 
-        TCLAP::ValueArg<std::string> filepathArg("f", "filepath", "Path to the BENCHMARK_CONFIG file", true, "", "string");
+        TCLAP::ValueArg<std::string> filepathArg("f", "filepath", "Path to a JSON pattern config, or to a PETSc binary matrix (.pm) whose SpMV halo is exchanged", true, "", "string");
         TCLAP::ValueArg<int> samplesArg("I", "samples", "Number of random samples to generate", false, 25, "int");
         TCLAP::ValueArg<int> windowArg("k", "window", "Number of startup-window gathers per sample, timed as one total; these absorb the backend's lazy setup", false, nwindow, "int");
         TCLAP::ValueArg<int> timedArg("n", "timed-iterations", "Number of gathers timed after the startup window", false, ntimed, "int");
@@ -119,7 +120,10 @@ void parseArgs(int argc, char **argv) {
         try {
             std::filesystem::path p(filepath);
 
-            if (std::filesystem::exists(p)) {
+            if (std::filesystem::exists(p) && p.extension() == ".pm") {
+                matrix_halo = read_matrix_halo(filepath);
+                matrix_input = true;
+            } else if (std::filesystem::exists(p)) {
                 std::ifstream file(filepath);
                 if (!file.is_open()) {
                     exitError("Error: Could not open file. ");
@@ -143,8 +147,12 @@ void parseArgs(int argc, char **argv) {
             std::string name;
             std::set<std::string> seen;
             while (std::getline(names, name, ',')) {
-                if (patterns.count(name) == 0) {
+                const bool known_name = matrix_input ? name == matrix_halo.name : patterns.count(name) > 0;
+                if (!known_name) {
                     std::string available;
+                    if (matrix_input) {
+                        available = " " + matrix_halo.name;
+                    }
                     for (const auto &[known, pattern] : patterns) {
                         available += " " + known;
                     }
@@ -283,6 +291,10 @@ void parseArgs(int argc, char **argv) {
                 printf("-MPI: %s\n", comm.c_str());
                 printf("-halotype: %s\n", type.c_str());
                 printf("-File: %s\n", filepath.c_str());
+                if (matrix_input) {
+                    printf("-matrix: %s (%d rows, %d cols, %ld nonzeros)\n", matrix_halo.name.c_str(),
+                           matrix_halo.global_rows, matrix_halo.global_cols, matrix_halo.global_nnz);
+                }
                 printf("-samples: %i\n", nsamples);
                 printf("-patterns: %s\n", pattern_list.empty() ? "all" : pattern_list.c_str());
                 printf("-warmup: %s\n", warmup.c_str());
