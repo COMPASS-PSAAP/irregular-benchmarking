@@ -343,6 +343,43 @@ Other keys (older configs carry `pattern_count` and `message_count`) are
 ignored. Each histogram is fill-forwarded (zero entries take the last non-zero
 value) and normalized into a probability distribution before sampling.
 
+## Analysis
+
+`analysis/` holds the scripts that analyzed the Dane campaigns, as they ran.
+They read pulled campaign output and need Python 3 with numpy, pandas, scipy,
+and matplotlib. Each expects a `data/` folder (one `<jobid>-gatherdata-<nodes>/`
+per launch) next to it and writes to `results/` there, so copy them into the
+folder that holds a pulled campaign, or pass the folders as arguments.
+
+- `python.py [DATA_DIR [RESULTS_DIR]]` computes, per node count, pattern, and
+  comparison (STANDARD vs MPI, LOCALITY vs MPI, LOCALITY vs STANDARD), each
+  launch's startup saving A and per-iteration saving d, and the 95% lower
+  bounds on the net saving D(N) of the statistics method (t bound on the mean,
+  sign test on the median, normal tolerance, order statistic) with the
+  break-even N*. Writes `launches.csv`, `nstar.csv`, `bounds.csv`,
+  `dropped.txt`, and `graphs/`.
+- `qq.py [RESULTS_DIR]` checks A and d for normality (Shapiro-Wilk, skew,
+  kurtosis, QQ plots): `normality.csv`, `qq/`.
+- `independence.py [DATA_DIR [RESULTS_DIR]]` tests launches for drift with
+  start time, lag-1 autocorrelation, and node-set overlap (Mantel):
+  `independence.csv`, `independence/`.
+- `compare_patterns.py` pairs each sampled pattern (`pattern_k` of t<n>.json)
+  with its matrix inside the same launches: structure, time per gather, and N*.
+  `archive/2026-10-07/compare_patterns.py` is the earlier unpaired version that
+  compared two separate campaigns.
+- `compare_profiles.py OLD_PROFILE.json PILOT_DIR RANKS_PER_NODE [OUT.csv]`
+  compares an old profile's `pattern_k`, the pilot's `coarse_<matrix>`, and the
+  true halo from the capture's Vernier traces, including what the sampler
+  draws from each.
+- `compare_launch.py PILOT_DIR LAUNCH_DIR...` lists, per launch, each matrix
+  beside its `pattern_k`, `coarse_`, and `fine_` versions: time per gather per
+  arm, LOCALITY's startup window, messages, bytes, and off-node share.
+- `halo-pattern/` (September 2026): `halo_pattern.py` computes each SuiteSparse
+  matrix's true SpMV halo per process count from the matrix file, and
+  `replay_similarity.py` compares the t<n>.json profiles and their replay with
+  it. `replay_similarity.py` reads its inputs from the PyCharm project path set
+  at its `PROJECT` line.
+
 ## Layout
 
 - `src/` - benchmark source: `main.cpp` wires together CLI parsing
@@ -362,6 +399,7 @@ value) and normalized into a probability distribution before sampling.
   `submit_*`, `summ_*`, `bindcheck.sh`, `countsr.c`, and the `.patch` files) is
   from the 2026-09-28 old-to-new locality_aware slowdown walk and the first
   ABCG builds.
+- `analysis/` - campaign analysis scripts (see "Analysis")
 - `cmake/` - project-local CMake find modules
 - `spack-envs/` - Spack environment files for supported systems
 
