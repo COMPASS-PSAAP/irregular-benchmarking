@@ -1,0 +1,99 @@
+diff -ruN abcg.orig/benchmarks/benchmark_cg_mpil.cpp abcg.pmpi/benchmarks/benchmark_cg_mpil.cpp
+--- x/benchmarks/benchmark_cg_mpil.cpp	2026-09-29 00:35:24.854506067 -0600
++++ x/benchmarks/benchmark_cg_mpil.cpp	2026-09-29 01:03:23.664606310 -0600
+@@ -47,18 +47,9 @@
+         {NEIGHBOR_ALLTOALLV_INIT_STANDARD, "Standard"},
+         {NEIGHBOR_ALLTOALLV_INIT_LOCALITY, "Locality"}
+     };
++    // Perf walk: only the PMPI allreduce is measured, so skip the other methods.
+     std::vector<std::pair<enum AllreduceMethod, std::string>> allreduce_configs = {
+-        {ALLREDUCE_PMPI, "PMPI"},
+-        {ALLREDUCE_RECURSIVE_DOUBLING, "Recursive Doubling"},
+-        {ALLREDUCE_DISSEMINATION_LOC, "Dissemination + Locality"},
+-        {ALLREDUCE_DISSEMINATION_ML, "Dissemination + ML"},
+-        {ALLREDUCE_DISSEMINATION_RADIX, "High-Radix"}
+-    };
+-    std::vector<std::pair<enum AllreduceInitMethod, std::string>> pers_allreduce_configs = {
+-        {ALLREDUCE_INIT_RECURSIVE_DOUBLING, "Recursive Doubling"},
+-        {ALLREDUCE_INIT_DISSEMINATION_LOC,"Dissemination + Locality"},
+-        {ALLREDUCE_INIT_DISSEMINATION_ML, "Dissemination + ML"},
+-        {ALLREDUCE_INIT_DISSEMINATION_RADIX, "High-Radix"}
++        {ALLREDUCE_PMPI, "PMPI"}
+     };
+ 
+     /*********************************************************
+@@ -129,73 +120,7 @@
+     }
+ 
+ 
+-    /*********************************************************
+-     * Test CG with Persistent Allreduce
+-     ********************************************************/
+-    if (rank == 0) 
+-        printf("Testing CG with Persistent Allreduce:\n");
+-
+-    for (size_t i = 0; i < spmv_configs.size(); i++)
+-    {
+-        MPIL_Set_alltoallv_neighbor_algorithm(spmv_configs[i].first);
+-        for (size_t j = 0; j < pers_allreduce_configs.size(); j++)
+-        {
+-            MPIL_Set_allreduce_init_algorithm(pers_allreduce_configs[j].first);        
+-            if (rank == 0) 
+-                printf("Testing with SpMV %s and Allreduce %s\n", 
+-                        spmv_configs[i].second.c_str(), 
+-                        pers_allreduce_configs[j].second.c_str());
+-
+-            // Set x to zero, test CG
+-            std::fill(x.begin(), x.end(), 0);
+-            n_iter = CG<SpMVCommMPIL, AllreduceCommMPILPers>(A, x, b);
+-            r = b;
+-            spmv(1.0, A, x, -1.0, r, spmv_comm);
+-            norm_r = sqrt(inner_product(r, r, allreduce_comm));
+-            if (rank == 0) 
+-                printf("After %d iterations, final res is %e\n", 
+-                        n_iter, norm_r / norm_b);
+-
+-            n_tests = calc_iters<SpMVCommMPIL, AllreduceCommMPILPers>(A, x, b);
+-            time = time_function<SpMVCommMPIL, AllreduceCommMPILPers>(n_tests, A, x, b);
+-            if (rank == 0) 
+-                printf("CG takes %e seconds\n", time);
+-        }
+-    }
+-
+-    /*********************************************************
+-     * Test CG with Persistent SpMVs and Allreduce
+-     ********************************************************/
+-    if (rank == 0) 
+-        printf("Testing CG with Persistent SpMVs and Allreduce:\n");
+-
+-    for (size_t i = 0; i < pers_spmv_configs.size(); i++)
+-    {
+-        MPIL_Set_alltoallv_neighbor_init_algorithm(pers_spmv_configs[i].first);
+-        for (size_t j = 0; j < pers_allreduce_configs.size(); j++)
+-        {
+-            MPIL_Set_allreduce_init_algorithm(pers_allreduce_configs[j].first);        
+-            if (rank == 0) 
+-                printf("Testing with SpMV %s and Allreduce %s\n", 
+-                        pers_spmv_configs[i].second.c_str(), 
+-                        pers_allreduce_configs[j].second.c_str());
+-
+-            // Set x to zero, test CG
+-            std::fill(x.begin(), x.end(), 0);
+-            n_iter = CG<SpMVCommMPILPers, AllreduceCommMPILPers>(A, x, b);
+-            r = b;
+-            spmv(1.0, A, x, -1.0, r, spmv_comm);
+-            norm_r = sqrt(inner_product(r, r, allreduce_comm));
+-            if (rank == 0) 
+-                printf("After %d iterations, final res is %e\n", n_iter, norm_r / norm_b);
+-
+-            n_tests = calc_iters<SpMVCommMPILPers, AllreduceCommMPILPers>(A, x, b);
+-            time = time_function<SpMVCommMPILPers, AllreduceCommMPILPers>(n_tests, A, x, b);
+-            if (rank == 0) 
+-                printf("CG takes %e seconds\n", time);
+-        }
+-    }
+-
++    // Perf walk: persistent-allreduce sections removed (they have no PMPI entry).
+ 
+     delete spmv_comm;
+     delete allreduce_comm;

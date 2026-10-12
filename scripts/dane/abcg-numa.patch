@@ -1,0 +1,66 @@
+diff -ruN abcg.orig/src/comm/numa_comm.hpp abcg.numa/src/comm/numa_comm.hpp
+--- x/src/comm/numa_comm.hpp	1969-12-31 17:00:00.000000000 -0700
++++ x/src/comm/numa_comm.hpp	2026-09-29 00:35:24.875033986 -0600
+@@ -0,0 +1,22 @@
++#ifndef NUMA_COMM_HPP
++#define NUMA_COMM_HPP
++
++#include "locality_aware.h"
++
++// Perf walk only: one MPIL_Comm for the whole run whose local groups are 14
++// consecutive ranks (one dane NUMA domain; rank r is bound to core r) instead of
++// MPIL_COMM_WORLD's one group per node. MPIL_Comm_update_locality refuses
++// MPIL_COMM_WORLD, and CG() builds new SpMV comm objects on every solve, so the
++// comm is created once on first use and reused.
++inline MPIL_Comm* numa_comm()
++{
++    static MPIL_Comm* xcomm = nullptr;
++    if (xcomm == nullptr)
++    {
++        MPIL_Comm_init(&xcomm, MPI_COMM_WORLD);
++        MPIL_Comm_update_locality(xcomm, 14);
++    }
++    return xcomm;
++}
++
++#endif
+diff -ruN abcg.orig/src/comm/spmv_comm_mpil.hpp abcg.numa/src/comm/spmv_comm_mpil.hpp
+--- x/src/comm/spmv_comm_mpil.hpp	2026-09-29 00:35:24.854506067 -0600
++++ x/src/comm/spmv_comm_mpil.hpp	2026-09-29 00:35:24.875033986 -0600
+@@ -3,6 +3,7 @@
+ 
+ #include "spmv_comm.hpp"
+ #include "locality_aware.h"
++#include "numa_comm.hpp"
+ 
+ class SpMVCommMPIL : public SpMVComm
+ {
+@@ -55,7 +56,7 @@
+                                          A->recv_comm.ptr.data(),
+                                          MPI_DOUBLE,
+                                          mpil_topo,
+-                                         MPIL_COMM_WORLD);
++                                         numa_comm());
+ 
+         }
+ 
+diff -ruN abcg.orig/src/comm/spmv_comm_mpil_pers.hpp abcg.numa/src/comm/spmv_comm_mpil_pers.hpp
+--- x/src/comm/spmv_comm_mpil_pers.hpp	2026-09-29 00:35:24.854506067 -0600
++++ x/src/comm/spmv_comm_mpil_pers.hpp	2026-09-29 00:35:24.875033986 -0600
+@@ -3,6 +3,7 @@
+ 
+ #include "spmv_comm.hpp"
+ #include "locality_aware.h"
++#include "numa_comm.hpp"
+ 
+ class SpMVCommMPILPers : public SpMVComm
+ {
+@@ -52,7 +53,7 @@
+                                                   A->off_proc_columns.data(),
+                                                   MPI_DOUBLE,
+                                                   mpil_topo,
+-                                                  MPIL_COMM_WORLD,
++                                                  numa_comm(),
+                                                   mpil_info,
+                                                   &spmv_req);
+ 

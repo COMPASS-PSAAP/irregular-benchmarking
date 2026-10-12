@@ -1,0 +1,35 @@
+diff --git a/src/cli.cpp b/src/cli.cpp
+index f7fc851..cecec9d 100644
+--- a/src/cli.cpp
++++ b/src/cli.cpp
+@@ -158,18 +158,18 @@ void parseArgs(int argc, char **argv) {
+         }
+ 
+         std::string split = splitArg.getValue();
+-        if (split == "U" || split == "u" || split == "NUMA") {
+-            MPIL_Set_split(NUMA);
+-            split = "NUMA";
+-        } else if (split == "N" || split == "n" || split == "NODE") {
+-            split = "NODE";
+-            MPIL_Set_split(NODE);
+-        } else if (split == "S" || split == "s" || split == "SOCKET") {
+-            split = "SOCKET";
+-            MPIL_Set_split(SOCKET);
+-        } else {
+-            exitError("ERROR: Invalid split choice [SOCKET,NODE,NUMA]\n");
+-        }
++//        if (split == "U" || split == "u" || split == "NUMA") {
++//            MPIL_Set_split(NUMA);
++//            split = "NUMA";
++//        } else if (split == "N" || split == "n" || split == "NODE") {
++//            split = "NODE";
++//            MPIL_Set_split(NODE);
++//        } else if (split == "S" || split == "s" || split == "SOCKET") {
++//            split = "SOCKET";
++//            MPIL_Set_split(SOCKET);
++//        } else {
++//            exitError("ERROR: Invalid split choice [SOCKET,NODE,NUMA]\n");
++//        }
+ 
+         std::string discovery = CRS.getValue();
+         if (discovery == "rma") {

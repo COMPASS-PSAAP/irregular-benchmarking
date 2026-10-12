@@ -352,6 +352,16 @@ value) and normalized into a probability distribution before sampling.
   `options.*`
 - `scripts/` - provenance recording and the Slurm campaign scripts (see
   "Running a campaign on Slurm")
+- `scripts/dane/` - the helpers these campaigns were built and checked with on
+  Dane, kept as they ran there (paths are `/g/g20/bacon4` and Dane's
+  `/usr/tce` toolchain): `build_step_bench.sh` builds the benchmark against one
+  locality_aware commit (with `cli-nosplit.patch` for libraries without
+  `MPIL_Set_split`), `build_abcg_pilots.sh` builds ABCG's pilot programs
+  (`build-mpi`, `build-old`, `build-vernier`), and `build_vernier.sh` builds
+  Vernier for the captures. The rest (`build_step.sh`, `build_candidate.sh`,
+  `submit_*`, `summ_*`, `bindcheck.sh`, `countsr.c`, and the `.patch` files) is
+  from the 2026-09-28 old-to-new locality_aware slowdown walk and the first
+  ABCG builds.
 - `cmake/` - project-local CMake find modules
 - `spack-envs/` - Spack environment files for supported systems
 

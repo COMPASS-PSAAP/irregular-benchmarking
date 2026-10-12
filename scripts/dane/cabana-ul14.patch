@@ -1,0 +1,42 @@
+--- core.orig/src/impl/Cabana_CommunicationPlan_LocalityAware.hpp2026-09-28 20:48:20.428875776 -0600
++++ core/src/impl/Cabana_CommunicationPlan_LocalityAware.hpp2026-09-28 20:48:20.437054885 -0600
+@@ -186,6 +186,9 @@
+ 
+         // Initialize MPI Advance objects.
+         MPIL_Comm_init( &xcomm0, this->comm() );
++        // Perf walk only: group ranks 14 at a time (one dane NUMA domain,
++        // assuming rank r is bound to core r) instead of per node.
++        MPIL_Comm_update_locality( xcomm0, 14 );
+         MPIL_Info_init( &xinfo0 );
+         MPIL_Topo_init( num_n, this->_neighbors.data(), MPI_UNWEIGHTED, num_n,
+                         this->_neighbors.data(), MPI_UNWEIGHTED, xinfo0,
+@@ -399,6 +402,9 @@
+         // Topo object must be initialized later after more information is
+         // gained
+         MPIL_Comm_init( &xcomm0, this->comm() );
++        // Perf walk only: group ranks 14 at a time (one dane NUMA domain,
++        // assuming rank r is bound to core r) instead of per node.
++        MPIL_Comm_update_locality( xcomm0, 14 );
+         MPIL_Info_init( &xinfo0 );
+ 
+         // Count the number of sends this rank will do to other ranks. Keep
+@@ -732,6 +738,9 @@
+ 
+         // Initialize MPI Advance objects.
+         MPIL_Comm_init( &xcomm0, this->comm() );
++        // Perf walk only: group ranks 14 at a time (one dane NUMA domain,
++        // assuming rank r is bound to core r) instead of per node.
++        MPIL_Comm_update_locality( xcomm0, 14 );
+         MPIL_Info_init( &xinfo0 );
+         MPIL_Topo_init( num_n, this->_neighbors.data(), MPI_UNWEIGHTED, num_n,
+                         this->_neighbors.data(), MPI_UNWEIGHTED, xinfo0,
+@@ -1071,6 +1080,9 @@
+         // Topo object must be initialized later after more information is
+         // gained
+         MPIL_Comm_init( &xcomm0, this->comm() );
++        // Perf walk only: group ranks 14 at a time (one dane NUMA domain,
++        // assuming rank r is bound to core r) instead of per node.
++        MPIL_Comm_update_locality( xcomm0, 14 );
+         MPIL_Info_init( &xinfo0 );
+ 
+         int num_export_rank = -1, total_num_export = -1;

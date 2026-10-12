@@ -1,0 +1,16 @@
+diff -ruN m31a/src/comm/allreduce_comm_pers.hpp m31b/src/comm/allreduce_comm_pers.hpp
+--- x/src/comm/allreduce_comm_pers.hpp	2026-09-29 00:38:17.990800527 -0600
++++ x/src/comm/allreduce_comm_pers.hpp	2026-09-29 00:38:17.990800527 -0600
+@@ -3,6 +3,12 @@
+ 
+ #include "allreduce_comm.hpp"
+ 
++// Open MPI 4.1 is MPI 3.1: persistent allreduce is the MPIX_ extension there.
++#if MPI_VERSION < 4
++#include <mpi-ext.h>
++#define MPI_Allreduce_init MPIX_Allreduce_init
++#endif
++
+ class AllreduceCommPers : public AllreduceComm
+ {
+     public:

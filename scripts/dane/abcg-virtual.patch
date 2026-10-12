@@ -1,0 +1,73 @@
+diff -ruN v0/src/comm/allreduce_comm.hpp v1/src/comm/allreduce_comm.hpp
+--- x/src/comm/allreduce_comm.hpp	2026-09-29 12:50:30.521592669 -0600
++++ x/src/comm/allreduce_comm.hpp	2026-09-29 12:50:30.521592669 -0600
+@@ -12,24 +12,25 @@
+             global_sum = NULL;
+         }
+ 
+-        ~AllreduceComm()
++        // Perf walk: virtual so CG()'s AllreduceComm* calls reach the subclasses.
++        virtual ~AllreduceComm()
+         {
+ 
+         }
+         
+-        void init(double* loc, double* glob)
++        virtual void init(double* loc, double* glob)
+         {
+             local_sum = loc;
+             global_sum = glob;
+         }
+ 
+-        void start()
++        virtual void start()
+         {
+              MPI_Allreduce(local_sum, global_sum, 1, MPI_DOUBLE, MPI_SUM, 
+                   MPI_COMM_WORLD);
+         }
+ 
+-        void wait()
++        virtual void wait()
+         {
+ 
+         }
+diff -ruN v0/src/comm/spmv_comm.hpp v1/src/comm/spmv_comm.hpp
+--- x/src/comm/spmv_comm.hpp	2026-09-29 12:50:30.521592669 -0600
++++ x/src/comm/spmv_comm.hpp	2026-09-29 12:50:30.521592669 -0600
+@@ -15,7 +15,8 @@
+             n = 0;
+         }
+ 
+-        ~SpMVComm()
++        // Perf walk: virtual so CG()'s SpMVComm* calls reach the MPIL subclasses.
++        virtual ~SpMVComm()
+         {
+             if (spmv_req)
+             {
+@@ -23,7 +24,7 @@
+             }
+         }
+ 
+-        void init(ParMat& A_in, double* sbuf, double* rbuf)
++        virtual void init(ParMat& A_in, double* sbuf, double* rbuf)
+         {
+             A = &A_in;
+             sendbuf = sbuf;
+@@ -40,7 +41,7 @@
+             }
+         }
+ 
+-        void start()
++        virtual void start()
+         {
+             int proc, start, end;
+             int tag = 0;
+@@ -75,7 +76,7 @@
+ 
+         }
+ 
+-        void wait()
++        virtual void wait()
+         {
+             if (n)
+             {
