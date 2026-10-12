@@ -282,6 +282,29 @@ next to the targets file, so every launch runs `<matrix>`, `coarse_<matrix>`, an
 `fine_<matrix>` side by side. Captures run with `VERNIER_NO_REQUESTS=1`, because
 Vernier 09d650b otherwise aborts every rank but 0 in `MPI_Finalize`.
 
+`scripts/vernier-to-pm.py` writes a PETSc binary matrix (`.pm`) whose SpMV halo
+is a Vernier pattern, so ABCG (which reads only `.pm`) and this benchmark's `.pm`
+mode can run samples as well as real matrices:
+
+```bash
+scripts/vernier-to-pm.py fine CAPTURE_DIR out.pm [--symmetric]
+scripts/vernier-to-pm.py coarse coarse.json coarse_<matrix> RANKS out.pm --seed S [--distinct-neighbors] [--symmetric]
+```
+
+`fine` takes each rank's recorded sends from a capture directory; `coarse` draws
+one sample of an aggregate pattern the way the benchmark draws it. Rank p
+sending k doubles to rank r becomes k distinct columns of p's block referenced
+by r's rows; each rank owns as many rows and columns as its largest message,
+with only the diagonal locally. The matrix has to run on exactly as many ranks
+as the pattern has. By default it is nonsymmetric with a dominant diagonal, so
+CG runs without an indefinite-matrix abort but is not true CG; `--symmetric`
+pairs every p->r message with r->p into a symmetric positive definite matrix
+(true CG), and stops if some message has no reverse, as in coarse samples.
+`out.pm.json` records the source, settings, and every rank's sends. Checked
+locally: ABCG captured on a `fine` matrix sends exactly the original capture's
+messages, on a `coarse` one exactly the sidecar's, and symmetric matrices take
+the same CG iteration count as ABCG's own CG.
+
 For example, 40 launches at each of four node counts:
 
 ```bash
@@ -350,8 +373,9 @@ value) and normalized into a probability distribution before sampling.
   Vernier capture input (`fine.*`), sampling (`sampling.*`), and the
   benchmark loop (`benchmark.*`); options shared across those are in
   `options.*`
-- `scripts/` - provenance recording and the Slurm campaign scripts (see
-  "Running a campaign on Slurm")
+- `scripts/` - provenance recording, the Slurm campaign scripts, and the
+  Vernier tools `vernier-config.py` and `vernier-to-pm.py` (see "Running a
+  campaign on Slurm")
 - `scripts/dane/` - the helpers these campaigns were built and checked with on
   Dane, kept as they ran there (paths are `/g/g20/bacon4` and Dane's
   `/usr/tce` toolchain): `build_step_bench.sh` builds the benchmark against one
