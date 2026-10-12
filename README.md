@@ -62,11 +62,12 @@ make
 ```bash
 ./irregular-benchmarking --filepath pattern_config.json [options]
 ./irregular-benchmarking --filepath matrix.pm [options]
+./irregular-benchmarking --filepath capture_dir/ [options]
 ```
 
 | Flag | Long form | Description | Default |
 |---|---|---|---|
-| `-f` | `--filepath` | A JSON pattern config, or a PETSc binary matrix (`.pm`) whose SpMV halo is exchanged (required) | - |
+| `-f` | `--filepath` | A JSON pattern config, a PETSc binary matrix (`.pm`) whose SpMV halo is exchanged, or a Vernier capture directory whose per-rank histograms each rank samples (required) | - |
 | `-I` | `--samples` | Number of random samples per pattern | `25` |
 | `-k` | `--window` | Startup-window gathers per sample, timed as one total | `10` |
 | `-n` | `--timed-iterations` | Gathers timed after the startup window (at least 1) | `1000` |
@@ -162,6 +163,30 @@ current and the old locality_aware, EXPORT halos pass and IMPORT halos report
 differing per-sender data on every rank, for JSON patterns as well as
 matrices, so IMPORT results through MPI_Advance should not be trusted yet.
 
+### Vernier capture input (fine patterns)
+
+Given a directory, the benchmark reads a Vernier capture of one pattern: one
+`vernier-<rank>-0.hist-combined.json` per rank, as written by ABCG's
+`benchmark_spmv` built with `ABCG_VERNIER` (see "Running a campaign on Slurm").
+Each rank reads only its own file, so every rank samples its own histograms,
+where a JSON config gives every rank the same ones.
+
+- The pattern is named `fine_<name>`, where `<name>` is the pattern Vernier
+  recorded in the files (ABCG names it after the matrix), so the name travels
+  with the data rather than with the directory.
+- Each sample sends the rank's recorded number of messages (Vernier's send
+  call types), each to a partner drawn from the rank's `neighbors` histogram
+  and with a size drawn uniformly within a bin of its `buffer_size` histogram,
+  as Vernier's own `vernier_sample.py` does. Vernier counts sends and receives
+  together in both histograms, and does not pair partners with sizes, so the
+  two are drawn independently. `--distinct-neighbors` applies as for JSON
+  patterns; with it, each rank's draws cover its captured partners exactly
+  once (its send count equals its partner count in an SpMV halo), so only the
+  sizes are random. Without it, repeated draws merge into fewer, larger
+  messages. Use it for fine patterns.
+- The capture must come from the same number of ranks as the run; otherwise
+  the run stops with an error.
+
 ### Recording provenance
 
 `scripts/provenance.sh` records a launch's provenance from inside the sbatch
@@ -169,8 +194,10 @@ job: job id, start time, node list, tasks per node, per-rank CPU binding, raw
 fabric queries for switch placement (Slurm on Dane has no topology), the
 compiler, MPI library, and build flags, the benchmark commit with its
 uncommitted diff, the Spack builds of localityaware, cabana, and kokkos and
-the state of their dev checkouts (with `PROV_SPACK_ENV` set), the pattern
-config's hash and pattern names, and the MPI- and Slurm-related environment.
+the state of their dev checkouts (with `PROV_SPACK_ENV` set), each input's
+hash and pattern names (for a Vernier capture directory, its per-rank files
+hashed together and the capture's `vernier_settings`), and the MPI- and
+Slurm-related environment.
 Pass it the benchmark's own srun geometry so the binding it records matches:
 
 ```bash
@@ -178,8 +205,8 @@ PROV_SPACK_ENV=~/spackenvs/spack-k5 scripts/provenance.sh OUTDIR build/src/irreg
     pattern_config.json -- --nodes=2 --ntasks-per-node=112
 ```
 
-`scripts/pattern-names.py CONFIG.json|MATRIX.pm` prints the input's pattern
-names, one per line.
+`scripts/pattern-names.py CONFIG.json|MATRIX.pm|CAPTURE_DIR` prints the
+input's pattern names, one per line.
 
 ### Running a campaign on Slurm
 
@@ -216,13 +243,63 @@ own checkout. Both scripts also take `BINARY` and `EXTRA_ARGS` from the
 environment at submission, e.g. to run a build against another locality_aware
 with `-s NUMA`, and record both in `launch_settings`. When `BINARY` was built
 from a git archive rather than a checkout, also set `BENCH_COMMIT`, since
-provenance.sh then has no repository to read the commit from. For example, 40
-launches at each of four node counts:
+provenance.sh then has no repository to read the commit from.
+
+`submit.sh` takes two more settings from the environment. `MAX_RUNNING`, if
+set, makes launch i also wait (`afterany`) for launch i - `MAX_RUNNING`, so at
+most that many of one call's launches run at once and the rest are spread over
+time. `EXCLUDE_NODES`, if set, is passed to every sbatch as `--exclude`.
+
+`ABCG_SPMV` and `ABCG_CG`, if set in the environment, are ABCG's
+`benchmark_spmv` (the SpMV halo exchange alone) and `benchmark_cg_pilot` (CG
+iterations), built from ABCG's `pilots` branch. Each `.pm` input then also
+gets the patterns `abcgspmv_<matrix>` and `abcgcg_<matrix>`: `pilot.sbatch`
+sizes each with that program's own STANDARD pilot (same `k`, `n`, warmup, and
+budget), and `gatherdata.sbatch` shuffles them into each launch on the same
+arms, running the matching program with `-c ARM -P PATTERN -W WARMUP -k K -n N`.
+Their output rows use this benchmark's format, so the analysis reads them as
+further patterns. ABCG's MPI arm is ABCG's own Isend/Irecv exchange and
+`MPI_Allreduce`, not Cabana's; set `ABCG_SPMV_MPI` and `ABCG_CG_MPI` to the same
+programs built without MPI Advance and the MPI arm runs those. The STANDARD and
+LOCALITY arms use MPI Advance's neighbor alltoallv (persistent by default) and
+its allreduce with `ALLREDUCE_PMPI`. `ABCG_PERSISTENT` (`on`, the default,
+`off`, or `on off`) picks the MPI Advance neighbor alltoallv: persistent
+(init once, then start/wait) as `abcgspmv_`/`abcgcg_` patterns, one call per
+exchange as `abcgspmvnp_`/`abcgcgnp_` patterns, each with its own pilot.
+`ABCG_EXTRA_ARGS` reaches every ABCG run.
+
+`VERNIER_SPMV`, if set, is ABCG's `benchmark_spmv` built with `ABCG_VERNIER`
+(MPI arm only, no MPI Advance). Before the pilots, `pilot.sbatch` captures one
+SpMV exchange of each `.pm` input with it, one `srun` each in `INPUTS` order,
+into `<pilot dir>/capture/NN_<matrix>/`. `capture/order.csv` records that order
+with each matrix's path, sha256, directory, and exit status, and
+`capture/vernier_settings` the capture program, libvernier, Vernier commit,
+command, and environment. `scripts/vernier-config.py` then checks every capture
+and writes `coarse.json` (one `coarse_<matrix>` pattern per matrix: rank 0's
+aggregate histograms, the same for every rank) and `generated_inputs` (that file
+and the capture directories, whose patterns are `fine_<matrix>`). The pilot sizes
+those like any other input, and `gatherdata.sbatch` adds `generated_inputs` from
+next to the targets file, so every launch runs `<matrix>`, `coarse_<matrix>`, and
+`fine_<matrix>` side by side. Captures run with `VERNIER_NO_REQUESTS=1`, because
+Vernier 09d650b otherwise aborts every rank but 0 in `MPI_Finalize`.
+
+For example, 40 launches at each of four node counts:
 
 ```bash
 mkdir -p ~/campaign && cd ~/campaign
 for n in 2 4 8 16; do
   /path/to/irregular-benchmarking/scripts/submit.sh $n /path/to/pattern_config.json 10 40
+done
+```
+
+or, capturing the matrices first so each launch runs every matrix beside its
+coarse and fine samples:
+
+```bash
+export VERNIER_SPMV=/path/to/ABCG/build-vernier/benchmarks/benchmark_spmv
+export EXTRA_ARGS="--distinct-neighbors"
+for n in 2 4 8 16; do
+  /path/to/irregular-benchmarking/scripts/submit.sh $n /path/to/a.pm,/path/to/b.pm 10 40
 done
 ```
 
@@ -246,30 +323,33 @@ their communication statistics:
   "my_pattern": {
     "comm_partners": { "4": 10, "8": 3 },
     "buffer_size": { "64": 5, "128": 2 },
-    "dist_to_neighbors": { "4": { "1": 2, "-1": 2 }, "8": { "2": 1, "-2": 2 } },
-    "pattern_count": 1,
-    "message_count": 13
+    "dist_to_neighbors": { "4": { "1": 2, "-1": 2 }, "8": { "2": 1, "-2": 2 } }
   }
 }
 ```
 
 - `comm_partners`: histogram of neighbor counts observed (key = number of
   neighbors, value = number of occurrences).
-- `buffer_size`: histogram of per-message buffer sizes in bytes.
+- `buffer_size`: histogram of per-message buffer sizes in bytes. A drawn key
+  is sent as that many bytes. Vernier keys each bin by its lower edge, so a
+  profile taken from Vernier's aggregate histograms (such as `coarse.json`)
+  sends every message at its bin's lower edge, short of the real sizes by up
+  to a bin width (8-15% of bytes per rank on the SuiteSparse SpMV captures at
+  2 nodes).
 - `dist_to_neighbors`: for each neighbor count, a histogram of neighbor
   rank offsets relative to the sending rank.
-- `pattern_count`, `message_count`: optional; `message_count` defaults to
-  half the sum of all `dist_to_neighbors` values.
 
-Each histogram is fill-forwarded (zero entries take the last non-zero
+Other keys (older configs carry `pattern_count` and `message_count`) are
+ignored. Each histogram is fill-forwarded (zero entries take the last non-zero
 value) and normalized into a probability distribution before sampling.
 
 ## Layout
 
 - `src/` - benchmark source: `main.cpp` wires together CLI parsing
   (`cli.*`), pattern loading (`pattern.*`), matrix input (`matrix.*`),
-  sampling (`sampling.*`), and the benchmark loop (`benchmark.*`); options
-  shared across those are in `options.*`
+  Vernier capture input (`fine.*`), sampling (`sampling.*`), and the
+  benchmark loop (`benchmark.*`); options shared across those are in
+  `options.*`
 - `scripts/` - provenance recording and the Slurm campaign scripts (see
   "Running a campaign on Slurm")
 - `cmake/` - project-local CMake find modules

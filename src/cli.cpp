@@ -13,6 +13,7 @@
 #include <Cabana_Core.hpp>
 #include <tclap/CmdLine.h>
 
+#include "fine.hpp"
 #include "matrix.hpp"
 #include "options.hpp"
 #include "pattern.hpp"
@@ -46,7 +47,7 @@ void parseArgs(int argc, char **argv) {
     try {
         TCLAP::CmdLine cmd("\nNOTE: TODO", ' ', "1.0");
 
-        TCLAP::ValueArg<std::string> filepathArg("f", "filepath", "Path to a JSON pattern config, or to a PETSc binary matrix (.pm) whose SpMV halo is exchanged", true, "", "string");
+        TCLAP::ValueArg<std::string> filepathArg("f", "filepath", "Path to a JSON pattern config, a PETSc binary matrix (.pm) whose SpMV halo is exchanged, or a Vernier capture directory whose per-rank histograms each rank samples (scripts/vernier-config.py)", true, "", "string");
         TCLAP::ValueArg<int> samplesArg("I", "samples", "Number of random samples to generate", false, 25, "int");
         TCLAP::ValueArg<int> windowArg("k", "window", "Number of startup-window gathers per sample, timed as one total; these absorb the backend's lazy setup", false, nwindow, "int");
         TCLAP::ValueArg<int> timedArg("n", "timed-iterations", "Number of gathers timed after the startup window", false, ntimed, "int");
@@ -123,6 +124,9 @@ void parseArgs(int argc, char **argv) {
             if (std::filesystem::exists(p) && p.extension() == ".pm") {
                 matrix_halo = read_matrix_halo(filepath);
                 matrix_input = true;
+            } else if (std::filesystem::is_directory(p)) {
+                fine_pattern = read_fine_pattern(filepath);
+                fine_input = true;
             } else if (std::filesystem::exists(p)) {
                 std::ifstream file(filepath);
                 if (!file.is_open()) {
@@ -147,11 +151,16 @@ void parseArgs(int argc, char **argv) {
             std::string name;
             std::set<std::string> seen;
             while (std::getline(names, name, ',')) {
-                const bool known_name = matrix_input ? name == matrix_halo.name : patterns.count(name) > 0;
+                const bool known_name = matrix_input ? name == matrix_halo.name
+                                        : fine_input ? name == fine_pattern.name
+                                                     : patterns.count(name) > 0;
                 if (!known_name) {
                     std::string available;
                     if (matrix_input) {
                         available = " " + matrix_halo.name;
+                    }
+                    if (fine_input) {
+                        available = " " + fine_pattern.name;
                     }
                     for (const auto &[known, pattern] : patterns) {
                         available += " " + known;
@@ -294,6 +303,10 @@ void parseArgs(int argc, char **argv) {
                 if (matrix_input) {
                     printf("-matrix: %s (%d rows, %d cols, %ld nonzeros)\n", matrix_halo.name.c_str(),
                            matrix_halo.global_rows, matrix_halo.global_cols, matrix_halo.global_nnz);
+                }
+                if (fine_input) {
+                    printf("-fine: %s (rank 0 of the capture: %d sends, %zu partners)\n", fine_pattern.name.c_str(),
+                           fine_pattern.sends, fine_pattern.neighbors.size());
                 }
                 printf("-samples: %i\n", nsamples);
                 printf("-patterns: %s\n", pattern_list.empty() ? "all" : pattern_list.c_str());

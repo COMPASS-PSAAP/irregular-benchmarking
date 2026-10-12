@@ -3,8 +3,8 @@
 #
 #   scripts/provenance.sh OUTDIR BINARY INPUTS [-- SRUN_ARGS...]
 #
-# INPUTS is one input file (JSON pattern config or .pm matrix) or several,
-# comma-separated.
+# INPUTS is one input (JSON pattern config, .pm matrix, or Vernier capture
+# directory) or several, comma-separated.
 #
 # SRUN_ARGS must be the geometry the benchmark's srun uses (e.g. --nodes=2
 # --ntasks-per-node=112), because binding is read from a separate srun step and
@@ -155,11 +155,17 @@ is_checkout() {
     for f in "${input_files[@]}"; do
         f=$(readlink -f "$f")
         echo "input: $f"
-        echo "  sha256: $(sha256sum "$f" | cut -d' ' -f1)"
+        if [ -d "$f" ]; then
+            # A capture directory: its per-rank files in name order, hashed together.
+            echo "  sha256 (combined files): $(cat "$f"/vernier-*-0.hist-combined.json | sha256sum | cut -d' ' -f1)"
+            echo "  capture settings:"
+            sed 's/^/    /' "$f/../vernier_settings"
+        else
+            echo "  sha256: $(sha256sum "$f" | cut -d' ' -f1)"
+        fi
         echo "  mtime: $(date -Iseconds -r "$f")"
         echo "  patterns: $(python3 "$script_dir/pattern-names.py" "$f" | tr '\n' ' ')"
     done
-    echo "vernier commit: not recorded in the inputs"
 
     section "environment"
     env | grep -E '^(SLURM_|OMPI_|PMIX_|PMI_|PSM2_|HFI_|FI_|UCX_|OMP_|KOKKOS_|MPIL_)|^(LD_LIBRARY_PATH|LD_PRELOAD|PATH)=' | sort

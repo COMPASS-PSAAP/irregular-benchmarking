@@ -1,5 +1,6 @@
 #include "benchmark.hpp"
 
+#include <algorithm>
 #include <cctype>
 #include <chrono>
 #include <cmath>
@@ -19,6 +20,7 @@
 #include <Cabana_Core.hpp>
 #include <Kokkos_Core.hpp>
 
+#include "fine.hpp"
 #include "matrix.hpp"
 #include "options.hpp"
 #include "pattern.hpp"
@@ -391,6 +393,52 @@ SampleLists sampledLists(Pattern &pattern, int comm_rank, int comm_size) {
     return lists;
 }
 
+// Draws one sample from this rank's own Vernier histograms, as Vernier's
+// generate_events_combined does: the rank's recorded number of sends, each to a
+// partner drawn from its neighbors histogram (which counts the partners it received
+// from as well) and with a size drawn from its buffer_size histogram. The combined
+// histograms do not pair partners with sizes, so the two are drawn independently.
+SampleLists fineLists(const FinePattern &pattern) {
+    std::vector<int> neighbors;
+    std::vector<int> neighbors_data;
+    std::vector<int> neighbors_bytes;
+    std::set<int> seen_neighbors;
+    const int reachable_targets = static_cast<int>(pattern.neighbors.size());
+
+    for (int i = 0; i < pattern.sends; ++i) {
+        int data_sentV = sample_interpolated(pattern.size_edges, pattern.size_counts);
+
+        // As in sampledLists: --distinct-neighbors redraws a partner already drawn,
+        // while the histogram still has an unused one.
+        const bool avoid_duplicates =
+            distinct_neighbors
+            && static_cast<int>(seen_neighbors.size()) < reachable_targets;
+
+        int node = -1;
+        do {
+            node = sample_from_map(pattern.neighbors);
+        } while (avoid_duplicates && seen_neighbors.count(node) > 0);
+
+        seen_neighbors.insert(node);
+        neighbors.push_back(node);
+        neighbors_data.push_back(bytes_to_elems(data_sentV));
+        neighbors_bytes.push_back(data_sentV);
+    }
+
+    SampleLists lists;
+    for (std::size_t m = 0; m < neighbors.size(); ++m) {
+        lists.num_tuple = std::max(lists.num_tuple, neighbors_data[m]);
+        for (int i = 0; i < neighbors_data[m]; ++i) {
+            lists.ids.push_back(i);
+            lists.ranks.push_back(neighbors[m]);
+        }
+    }
+    lists.partners = neighbors;
+    lists.partner_bytes = neighbors_bytes;
+    lists.drawn_neighbors = pattern.sends;
+    return lists;
+}
+
 // The matrix's SpMV halo, the same for every sample: one double per x entry.
 // For IMPORT the lists name what this rank receives, so the per-message rows
 // then describe incoming messages.
@@ -433,6 +481,8 @@ void run_benchmark() {
     if (names.empty()) {
         if (matrix_input) {
             names.push_back(matrix_halo.name);
+        } else if (fine_input) {
+            names.push_back(fine_pattern.name);
         } else {
             for (const auto &[name, pattern] : patterns) {
                 names.push_back(name);
@@ -442,9 +492,9 @@ void run_benchmark() {
 
     for (const std::string &name : names) {
         for (int sample_iter = 0; sample_iter < nsamples; sample_iter++) {
-            const SampleLists lists = matrix_input
-                                          ? matrixLists(halo_type)
-                                          : sampledLists(patterns.at(name), comm_rank, comm_size);
+            const SampleLists lists = matrix_input ? matrixLists(halo_type)
+                                      : fine_input ? fineLists(fine_pattern)
+                                                   : sampledLists(patterns.at(name), comm_rank, comm_size);
             const int nneighborsV = lists.drawn_neighbors;
             const int numberOfmessages = static_cast<int>(lists.partners.size());
             long total_bytes = 0;

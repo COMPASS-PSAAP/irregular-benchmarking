@@ -15,6 +15,16 @@ EXTRA_ARGS=${EXTRA_ARGS:-}      # extra benchmark flags for every run, word-spli
 # For a BINARY built from a git archive (no checkout for provenance.sh to read),
 # set BENCH_COMMIT to the benchmark commit it was built from.
 BENCH_COMMIT=${BENCH_COMMIT:-}
+# ABCG_SPMV and ABCG_CG (env): ABCG's benchmark_spmv and benchmark_cg_pilot built with
+# MPI Advance, needed when the targets file has abcgspmv[np]_<matrix> or abcgcg[np]_<matrix>
+# patterns (see pilot.sbatch; the np patterns run with --persistent off). ABCG_SPMV_MPI and ABCG_CG_MPI, if set, are the same programs
+# built without MPI Advance, and the MPI arm runs those, so no MPI Advance code is in
+# its binary. ABCG_EXTRA_ARGS goes to every ABCG run.
+ABCG_SPMV=${ABCG_SPMV:-}
+ABCG_CG=${ABCG_CG:-}
+ABCG_SPMV_MPI=${ABCG_SPMV_MPI:-}
+ABCG_CG_MPI=${ABCG_CG_MPI:-}
+ABCG_EXTRA_ARGS=${ABCG_EXTRA_ARGS:-}
 export PROV_SPACK_ENV=/g/g20/bacon4/spackenvs/spack-k5   # read by provenance.sh
 SAMPLES=1      # times each pattern is run on each arm, in shuffled order
 ARMS="MPI STANDARD LOCALITY"   # MPI: plain MPI (-c MPI); the others: MPI Advance -a
@@ -24,6 +34,8 @@ SHUFFLE_SEED=   # empty: draw a new one; set it to repeat an earlier launch's or
 # INPUTS is one input file or several, comma-separated (JSON pattern configs and/or
 # .pm matrices), as given to pilot.sbatch. TARGETS_FILE is the targets file the pilot
 # wrote for this node count, so every launch at a node count uses the same k and n.
+# If that pilot captured the matrices with Vernier (VERNIER_SPMV), the generated_inputs
+# next to TARGETS_FILE (its coarse.json and capture directories) are added to INPUTS.
 # WARMUP is the benchmark's -W: none, nearest (rank +/- 1, the default) or all.
 if [ $# -lt 3 ] || [ $# -gt 4 ]; then
     echo "usage: sbatch -N NODES $0 NODES INPUTS TARGETS_FILE [WARMUP]" >&2
@@ -44,8 +56,13 @@ if [ "$nodes" != "$SLURM_JOB_NUM_NODES" ]; then
     echo "NODES is $nodes but the job has $SLURM_JOB_NUM_NODES nodes; submit with sbatch -N $nodes" >&2
     exit 1
 fi
+generated=$(dirname "$targets_file")/generated_inputs
+if [ -f "$generated" ]; then
+    mapfile -t generated_inputs < "$generated"
+    input_files+=("${generated_inputs[@]}")
+fi
 for i in "${!input_files[@]}"; do
-    if [ ! -f "${input_files[$i]}" ]; then
+    if [ ! -e "${input_files[$i]}" ]; then
         echo "input file not found: ${input_files[$i]}" >&2
         exit 1
     fi
@@ -56,6 +73,16 @@ if [ ! -s "$targets_file" ]; then
     echo "targets file missing or empty: $3" >&2
     exit 1
 fi
+for program in "abcgspmv $ABCG_SPMV" "abcgcg $ABCG_CG"; do
+    read -r prefix bin <<< "$program"
+    if grep -q -E "^${prefix}(np)?_" "$targets_file" && [ ! -x "$bin" ]; then
+        echo "targets has ${prefix}_ patterns but its program is not set or not executable: '$bin'" >&2
+        exit 1
+    fi
+done
+for bin in "$ABCG_SPMV_MPI" "$ABCG_CG_MPI"; do
+    [ -z "$bin" ] || [ -x "$bin" ] || { echo "ABCG MPI-only program not executable: $bin" >&2; exit 1; }
+done
 
 out_dir=$SLURM_SUBMIT_DIR/$SLURM_JOB_ID-$SLURM_JOB_NAME-$nodes
 mkdir -p "$out_dir"
@@ -72,6 +99,13 @@ echo "$targets_file" > "$out_dir/targets_source"
 # Which input file each pattern comes from, for each run's -f.
 for input_file in "${input_files[@]}"; do
     python3 "$REPO/scripts/pattern-names.py" "$input_file" | sed "s|\$| $input_file|"
+    # A .pm input also feeds the ABCG patterns that targets has for it.
+    if [ "${input_file%.pm}" != "$input_file" ]; then
+        for prefix in abcgspmv abcgspmvnp abcgcg abcgcgnp; do
+            pattern=${prefix}_$(basename "$input_file" .pm)
+            grep -q "^$pattern " "$out_dir/targets" && echo "$pattern $input_file"
+        done
+    fi
 done > "$out_dir/pattern_files"
 
 # Each pattern SAMPLES times on each arm, all shuffled together; the order
@@ -82,6 +116,13 @@ echo "binary: $BINARY" > "$out_dir/launch_settings"
 echo "extra args: $EXTRA_ARGS" >> "$out_dir/launch_settings"
 echo "benchmark commit: ${BENCH_COMMIT:-see provenance}" >> "$out_dir/launch_settings"
 echo "inputs: $inputs" >> "$out_dir/launch_settings"
+for program in "abcgspmv $ABCG_SPMV" "abcgcg $ABCG_CG" "abcgspmv-mpi-arm $ABCG_SPMV_MPI" \
+    "abcgcg-mpi-arm $ABCG_CG_MPI"; do
+    read -r prefix bin <<< "$program"
+    [ -n "$bin" ] && echo "$prefix binary: $bin (sha256 $(sha256sum "$bin" | cut -d' ' -f1))" \
+        >> "$out_dir/launch_settings"
+done
+[ -n "$ABCG_SPMV$ABCG_CG" ] && echo "abcg extra args: $ABCG_EXTRA_ARGS" >> "$out_dir/launch_settings"
 shuffle_seed=${SHUFFLE_SEED:-$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')}
 echo "$shuffle_seed" > "$out_dir/shuffle_seed"
 while read -r pattern k n; do
@@ -111,9 +152,32 @@ while read -r pattern k n arm; do
     input_file=$(awk -v p="$pattern" '$1 == p {print $2; exit}' "$out_dir/pattern_files")
     start=$(date -Iseconds)
     # srun would otherwise read the rest of the schedule from stdin.
-    srun --nodes="$nodes" --ntasks-per-node="$SLURM_NTASKS_PER_NODE" "$BINARY" \
-        -r "${backend[@]}" -x EXPORT -q -b -W "$warmup" -I 1 \
-        -P "$pattern" -k "$k" -n "$n" $EXTRA_ARGS -f "$input_file" > "$run_file" 2>&1 < /dev/null
+    case $pattern in
+        abcgspmv_* | abcgcg_* | abcgspmvnp_* | abcgcgnp_*)
+            family=${pattern%%_*}
+            persistent=on
+            [ "${family%np}" != "$family" ] && persistent=off
+            if [ "${family%np}" = abcgcg ]; then
+                bin=$ABCG_CG
+                mpi_bin=$ABCG_CG_MPI
+            else
+                bin=$ABCG_SPMV
+                mpi_bin=$ABCG_SPMV_MPI
+            fi
+            if [ "$arm" = MPI ] && [ -n "$mpi_bin" ]; then
+                bin=$mpi_bin
+            fi
+            srun --nodes="$nodes" --ntasks-per-node="$SLURM_NTASKS_PER_NODE" "$bin" "$input_file" \
+                -c "$arm" -P "$pattern" -W "$warmup" -k "$k" -n "$n" --persistent "$persistent" \
+                $ABCG_EXTRA_ARGS \
+                > "$run_file" 2>&1 < /dev/null
+            ;;
+        *)
+            srun --nodes="$nodes" --ntasks-per-node="$SLURM_NTASKS_PER_NODE" "$BINARY" \
+                -r "${backend[@]}" -x EXPORT -q -b -W "$warmup" -I 1 \
+                -P "$pattern" -k "$k" -n "$n" $EXTRA_ARGS -f "$input_file" > "$run_file" 2>&1 < /dev/null
+            ;;
+    esac
     status=$?
     seed=$(sed -n 's/^-seed: \([0-9]*\).*/\1/p' "$run_file")
     echo "$run,$pattern,$arm,$seed,$k,$n,$start,$(date -Iseconds),$status,$(basename "$run_file")" \

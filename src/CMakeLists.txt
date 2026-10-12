@@ -4,6 +4,7 @@ set(SOURCES
     options.cpp
     pattern.cpp
     matrix.cpp
+    fine.cpp
     sampling.cpp
     benchmark.cpp
     )
@@ -13,6 +14,7 @@ set(HEADERS
     options.hpp
     pattern.hpp
     matrix.hpp
+    fine.hpp
     sampling.hpp
     benchmark.hpp
     )
