@@ -29,7 +29,7 @@ ABCG_EXTRA_ARGS=${ABCG_EXTRA_ARGS:-}   # extra flags for every ABCG run
 # records that order, since Vernier names its files only by rank. scripts/vernier-config.py
 # then turns the captures into coarse.json (coarse_<matrix>, the same histograms for
 # every rank) and the capture directories themselves (fine_<matrix>, each rank its own
-# histograms), which are piloted like any other input and listed in generated_inputs
+# recorded sends), which are piloted like any other input and listed in generated_inputs
 # for gatherdata.sbatch.
 VERNIER_SPMV=${VERNIER_SPMV:-}
 export PROV_SPACK_ENV=/g/g20/bacon4/spackenvs/spack-k5   # read by provenance.sh
@@ -117,7 +117,7 @@ if [ -n "$VERNIER_SPMV" ]; then
     # but 0 in MPI_Finalize (its aggregate printer waits with MPI_Wait, not PMPI_Wait,
     # on a request it never recorded). Off, the trace shows "-" for request ids; the
     # histograms do not use them.
-    capture_env="VERNIER_NO_REQUESTS=1 VERNIER_NO_HIERARCHICAL_HISTOGRAM_MANAGER=1"
+    capture_env="VERNIER_NO_REQUESTS=1"
     {
         echo "capture program: $VERNIER_SPMV (sha256 $(sha256sum "$VERNIER_SPMV" | cut -d' ' -f1))"
         echo "libvernier: $vernier_lib (sha256 $(sha256sum "$vernier_lib" | cut -d' ' -f1))"

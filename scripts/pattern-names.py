@@ -21,7 +21,7 @@ def main():
         print(os.path.splitext(os.path.basename(path))[0])
         return
     if os.path.isdir(path):
-        with open(os.path.join(path, "vernier-0-0.hist-combined.json")) as f:
+        with open(os.path.join(path, "vernier-0-0.hist-hierarchical.json")) as f:
             pattern_map = json.load(f)[0]["pattern_map"]
         for pair in pattern_map.split(","):
             print("fine_" + pair.split(":")[0])

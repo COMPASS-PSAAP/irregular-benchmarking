@@ -47,7 +47,7 @@ void parseArgs(int argc, char **argv) {
     try {
         TCLAP::CmdLine cmd("\nNOTE: TODO", ' ', "1.0");
 
-        TCLAP::ValueArg<std::string> filepathArg("f", "filepath", "Path to a JSON pattern config, a PETSc binary matrix (.pm) whose SpMV halo is exchanged, or a Vernier capture directory whose per-rank histograms each rank samples (scripts/vernier-config.py)", true, "", "string");
+        TCLAP::ValueArg<std::string> filepathArg("f", "filepath", "Path to a JSON pattern config, a PETSc binary matrix (.pm) whose SpMV halo is exchanged, or a Vernier capture directory whose recorded sends (EXPORT) or receives (IMPORT) each rank replays (scripts/vernier-config.py)", true, "", "string");
         TCLAP::ValueArg<int> samplesArg("I", "samples", "Number of random samples to generate", false, 25, "int");
         TCLAP::ValueArg<int> windowArg("k", "window", "Number of startup-window gathers per sample, timed as one total; these absorb the backend's lazy setup", false, nwindow, "int");
         TCLAP::ValueArg<int> timedArg("n", "timed-iterations", "Number of gathers timed after the startup window", false, ntimed, "int");
@@ -305,8 +305,9 @@ void parseArgs(int argc, char **argv) {
                            matrix_halo.global_rows, matrix_halo.global_cols, matrix_halo.global_nnz);
                 }
                 if (fine_input) {
-                    printf("-fine: %s (rank 0 of the capture: %d sends, %zu partners)\n", fine_pattern.name.c_str(),
-                           fine_pattern.sends, fine_pattern.neighbors.size());
+                    printf("-fine: %s (rank 0 of the capture: %d sends, %d receives recorded)\n",
+                           fine_pattern.name.c_str(), fine_message_count(fine_pattern, EXPORT),
+                           fine_message_count(fine_pattern, IMPORT));
                 }
                 printf("-samples: %i\n", nsamples);
                 printf("-patterns: %s\n", pattern_list.empty() ? "all" : pattern_list.c_str());

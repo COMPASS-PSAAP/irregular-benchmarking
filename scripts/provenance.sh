@@ -157,7 +157,7 @@ is_checkout() {
         echo "input: $f"
         if [ -d "$f" ]; then
             # A capture directory: its per-rank files in name order, hashed together.
-            echo "  sha256 (combined files): $(cat "$f"/vernier-*-0.hist-combined.json | sha256sum | cut -d' ' -f1)"
+            echo "  sha256 (hierarchical files): $(cat "$f"/vernier-*-0.hist-hierarchical.json | sha256sum | cut -d' ' -f1)"
             echo "  capture settings:"
             sed 's/^/    /' "$f/../vernier_settings"
         else
