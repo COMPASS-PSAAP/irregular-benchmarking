@@ -397,6 +397,11 @@ folder that holds a pulled campaign, or pass the folders as arguments.
 - `compare_launch.py PILOT_DIR LAUNCH_DIR...` lists, per launch, each matrix
   beside its `pattern_k`, `coarse_`, and `fine_` versions: time per gather per
   arm, LOCALITY's startup window, messages, bytes, and off-node share.
+- `compare_fiveway.py PILOT_DIR LAUNCH_DIR [OUT.csv]` lists, for each matrix
+  and arm, every way the five-way tests exchange its halo (`.pm`, `coarse_`,
+  `fine_`, ABCG SpMV and CG, persistent and not): time per gather (per CG
+  iteration for CG), startup window, messages, bytes, and the time relative to
+  the benchmark's `.pm` run; it also counts verify and ABCG check lines.
 - `halo-pattern/` (September 2026): `halo_pattern.py` computes each SuiteSparse
   matrix's true SpMV halo per process count from the matrix file, and
   `replay_similarity.py` compares the t<n>.json profiles and their replay with
