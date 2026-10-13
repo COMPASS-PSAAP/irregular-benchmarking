@@ -1,6 +1,8 @@
 #include "pattern.hpp"
 
 #include <algorithm>
+#include <stdexcept>
+#include <string>
 #include <utility>
 
 #include "options.hpp"
@@ -58,7 +60,24 @@ void from_json(const json &j, Pattern &p) {
         for (auto &[k, v] : temp) {
             p.buffer_size[k] = (total > 0) ? (double)v / total : 0.0;
         }
-        data_sent_max = std::max(p.buffer_size.rbegin()->first, data_sent_max);
+
+        int largest = p.buffer_size.rbegin()->first;
+        if (j.contains("buffer_size_bins")) {
+            const std::string bins = j.at("buffer_size_bins").get<std::string>();
+            if (bins != "lower_edge") {
+                throw std::runtime_error("buffer_size_bins must be \"lower_edge\", not \"" + bins + "\"");
+            }
+            p.spread_sizes = true;
+            for (auto &[k, v] : temp) {
+                p.size_edges.push_back(k);
+                p.size_counts.push_back(v);
+            }
+            // The last bin is taken to be as wide as the first (sample_interpolated).
+            if (p.size_edges.size() > 1) {
+                largest += static_cast<int>(p.size_edges[1] - p.size_edges[0]);
+            }
+        }
+        data_sent_max = std::max(largest, data_sent_max);
     }
 
     // --- dist_to_neighbors ---

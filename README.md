@@ -166,24 +166,22 @@ matrices, so IMPORT results through MPI_Advance should not be trusted yet.
 ### Vernier capture input (fine patterns)
 
 Given a directory, the benchmark reads a Vernier capture of one pattern: one
-`vernier-<rank>-0.hist-combined.json` per rank, as written by ABCG's
+`vernier-<rank>-0.hist-hierarchical.json` per rank, as written by ABCG's
 `benchmark_spmv` built with `ABCG_VERNIER` (see "Running a campaign on Slurm").
-Each rank reads only its own file, so every rank samples its own histograms,
-where a JSON config gives every rank the same ones.
+Each rank reads only its own file, which holds, per MPI call type and per
+partner rank, a histogram of message sizes.
 
 - The pattern is named `fine_<name>`, where `<name>` is the pattern Vernier
   recorded in the files (ABCG names it after the matrix), so the name travels
   with the data rather than with the directory.
-- Each sample sends the rank's recorded number of messages (Vernier's send
-  call types), each to a partner drawn from the rank's `neighbors` histogram
-  and with a size drawn uniformly within a bin of its `buffer_size` histogram,
-  as Vernier's own `vernier_sample.py` does. Vernier counts sends and receives
-  together in both histograms, and does not pair partners with sizes, so the
-  two are drawn independently. `--distinct-neighbors` applies as for JSON
-  patterns; with it, each rank's draws cover its captured partners exactly
-  once (its send count equals its partner count in an SpMV halo), so only the
-  sizes are random. Without it, repeated draws merge into fewer, larger
-  messages. Use it for fine patterns.
+- With `--type EXPORT` (the default) each rank replays its recorded sends,
+  since Cabana works out the receives from the export lists; with `--type
+  IMPORT` it replays its recorded receives. Every message goes to its recorded
+  partner, with a size drawn within that partner's own size bins. A capture of
+  one exchange (as `pilot.sbatch` makes) has one bin per partner, so the lists
+  are exactly the captured ones. A capture of several exchanges would replay
+  every exchange's messages at once, so capture one.
+- Partners are not drawn, so `--distinct-neighbors` does not apply.
 - The capture must come from the same number of ranks as the run; otherwise
   the run stops with an error.
 
@@ -276,12 +274,36 @@ with each matrix's path, sha256, directory, and exit status, and
 `capture/vernier_settings` the capture program, libvernier, Vernier commit,
 command, and environment. `scripts/vernier-config.py` then checks every capture
 and writes `coarse.json` (one `coarse_<matrix>` pattern per matrix: rank 0's
-aggregate histograms, the same for every rank) and `generated_inputs` (that file
-and the capture directories, whose patterns are `fine_<matrix>`). The pilot sizes
+aggregate histograms, the same for every rank, sends and receives together)
+and `generated_inputs` (that file and the capture directories, whose patterns
+are `fine_<matrix>`: each rank's own recorded sends). The pilot sizes
 those like any other input, and `gatherdata.sbatch` adds `generated_inputs` from
 next to the targets file, so every launch runs `<matrix>`, `coarse_<matrix>`, and
 `fine_<matrix>` side by side. Captures run with `VERNIER_NO_REQUESTS=1`, because
 Vernier 09d650b otherwise aborts every rank but 0 in `MPI_Finalize`.
+
+`scripts/vernier-to-pm.py` writes a PETSc binary matrix (`.pm`) whose SpMV halo
+is a Vernier pattern, so ABCG (which reads only `.pm`) and this benchmark's `.pm`
+mode can run samples as well as real matrices:
+
+```bash
+scripts/vernier-to-pm.py fine CAPTURE_DIR out.pm [--symmetric]
+scripts/vernier-to-pm.py coarse coarse.json coarse_<matrix> RANKS out.pm --seed S [--distinct-neighbors] [--symmetric]
+```
+
+`fine` takes each rank's recorded sends from a capture directory; `coarse` draws
+one sample of an aggregate pattern the way the benchmark draws it. Rank p
+sending k doubles to rank r becomes k distinct columns of p's block referenced
+by r's rows; each rank owns as many rows and columns as its largest message,
+with only the diagonal locally. The matrix has to run on exactly as many ranks
+as the pattern has. By default it is nonsymmetric with a dominant diagonal, so
+CG runs without an indefinite-matrix abort but is not true CG; `--symmetric`
+pairs every p->r message with r->p into a symmetric positive definite matrix
+(true CG), and stops if some message has no reverse, as in coarse samples.
+`out.pm.json` records the source, settings, and every rank's sends. Checked
+locally: ABCG captured on a `fine` matrix sends exactly the original capture's
+messages, on a `coarse` one exactly the sidecar's, and symmetric matrices take
+the same CG iteration count as ABCG's own CG.
 
 For example, 40 launches at each of four node counts:
 
@@ -297,7 +319,6 @@ coarse and fine samples:
 
 ```bash
 export VERNIER_SPMV=/path/to/ABCG/build-vernier/benchmarks/benchmark_spmv
-export EXTRA_ARGS="--distinct-neighbors"
 for n in 2 4 8 16; do
   /path/to/irregular-benchmarking/scripts/submit.sh $n /path/to/a.pm,/path/to/b.pm 10 40
 done
@@ -331,11 +352,13 @@ their communication statistics:
 - `comm_partners`: histogram of neighbor counts observed (key = number of
   neighbors, value = number of occurrences).
 - `buffer_size`: histogram of per-message buffer sizes in bytes. A drawn key
-  is sent as that many bytes. Vernier keys each bin by its lower edge, so a
-  profile taken from Vernier's aggregate histograms (such as `coarse.json`)
-  sends every message at its bin's lower edge, short of the real sizes by up
-  to a bin width (8-15% of bytes per rank on the SuiteSparse SpMV captures at
-  2 nodes).
+  is sent as that many bytes, unless the pattern has `"buffer_size_bins":
+  "lower_edge"`: then the keys are the lower edges of equal-width bins (as in
+  Vernier's histograms) and each size is drawn uniformly within its bin, the
+  last bin taken to be as wide as the first. `scripts/vernier-config.py` marks
+  `coarse.json` this way. Sent at their lower edges, the SuiteSparse SpMV
+  captures at 2 nodes came out 8-16% short of the real mean message size;
+  drawn within the bins, 0-1%.
 - `dist_to_neighbors`: for each neighbor count, a histogram of neighbor
   rank offsets relative to the sending rank.
 
@@ -387,8 +410,9 @@ folder that holds a pulled campaign, or pass the folders as arguments.
   Vernier capture input (`fine.*`), sampling (`sampling.*`), and the
   benchmark loop (`benchmark.*`); options shared across those are in
   `options.*`
-- `scripts/` - provenance recording and the Slurm campaign scripts (see
-  "Running a campaign on Slurm")
+- `scripts/` - provenance recording, the Slurm campaign scripts, and the
+  Vernier tools `vernier-config.py` and `vernier-to-pm.py` (see "Running a
+  campaign on Slurm")
 - `scripts/dane/` - the helpers these campaigns were built and checked with on
   Dane, kept as they ran there (paths are `/g/g20/bacon4` and Dane's
   `/usr/tce` toolchain): `build_step_bench.sh` builds the benchmark against one

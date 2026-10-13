@@ -10,11 +10,14 @@ Writes, in that order:
   OUT_DIR/coarse.json       one coarse_<matrix> entry per capture: rank 0's
                             hist-aggregate histograms without Vernier's
                             [{pattern_map}, {comm_map}, ...] wrapper, the shape
-                            the benchmark reads with -f
+                            the benchmark reads with -f, marked
+                            "buffer_size_bins": "lower_edge" so the benchmark
+                            draws sizes within each bin
   OUT_DIR/generated_inputs  coarse.json, then each capture directory (read by
                             the benchmark as the fine pattern fine_<matrix>)
 Fails, writing nothing, if a capture exited non-zero, holds another pattern than
-its matrix, or lacks a per-rank combined file for any rank.
+its matrix, or lacks a per-rank hierarchical file (what the fine pattern reads)
+for any rank.
 Usage: vernier-config.py CAPTURE_DIR OUT_DIR
 """
 import csv
@@ -48,13 +51,14 @@ def main():
         names, world_size, histograms = load(os.path.join(run_dir, "vernier-0-0.hist-aggregate.json"))
         if list(names) != [matrix]:
             sys.exit(f"{run_dir} holds patterns {list(names)}, expected only {matrix}")
-        coarse["coarse_" + matrix] = histograms["pattern_" + names[matrix]]
+        coarse["coarse_" + matrix] = dict(histograms["pattern_" + names[matrix]],
+                                          buffer_size_bins="lower_edge")
         for rank in range(world_size):
-            combined = os.path.join(run_dir, f"vernier-{rank}-0.hist-combined.json")
-            if not os.path.isfile(combined):
-                sys.exit(f"{run_dir} has no combined file for rank {rank} of {world_size}")
-        if os.path.exists(os.path.join(run_dir, f"vernier-{world_size}-0.hist-combined.json")):
-            sys.exit(f"{run_dir} has combined files beyond its {world_size} ranks")
+            per_rank = os.path.join(run_dir, f"vernier-{rank}-0.hist-hierarchical.json")
+            if not os.path.isfile(per_rank):
+                sys.exit(f"{run_dir} has no hierarchical file for rank {rank} of {world_size}")
+        if os.path.exists(os.path.join(run_dir, f"vernier-{world_size}-0.hist-hierarchical.json")):
+            sys.exit(f"{run_dir} has hierarchical files beyond its {world_size} ranks")
         fine_dirs.append(os.path.abspath(run_dir))
 
     coarse_path = os.path.abspath(os.path.join(out_dir, "coarse.json"))

@@ -3,6 +3,7 @@
 
 #include <map>
 #include <string>
+#include <vector>
 
 #include <nlohmann/json.hpp>
 
@@ -14,11 +15,18 @@ struct Pattern {
     std::map<int, double> comm_partners;                      // fill-forward + normalized
     std::map<int, double> buffer_size;                        // fill-forward + normalized
     std::map<int, std::map<int, double>> dist_to_neighbors;   // each inner map normalized
+    // With "buffer_size_bins": "lower_edge" (Vernier's histograms, whose keys are
+    // bin lower edges), sizes are drawn within each bin from these fill-forwarded
+    // bins; otherwise each buffer_size key is sent as that many bytes.
+    bool spread_sizes = false;
+    std::vector<double> size_edges;
+    std::vector<int> size_counts;
 };
 
 // Populates a Pattern from its JSON representation, filling forward zero
 // entries and normalizing counts into probabilities. Also widens the global
-// data_sent_max option bound (see options.hpp) to fit this pattern.
+// data_sent_max option bound (see options.hpp) to fit this pattern: its largest
+// key, or with spread sizes the end of its last bin.
 void from_json(const nlohmann::json &j, Pattern &p);
 
 extern std::map<std::string, Pattern> patterns;

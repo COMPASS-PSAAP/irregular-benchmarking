@@ -356,7 +356,8 @@ SampleLists sampledLists(Pattern &pattern, int comm_rank, int comm_size) {
     }
 
     for (int i = 0; i < numberOfmessages; ++i) {
-        int data_sentV = sample_from_map(pattern.buffer_size);
+        int data_sentV = pattern.spread_sizes ? sample_interpolated(pattern.size_edges, pattern.size_counts)
+                                              : sample_from_map(pattern.buffer_size);
         int n_export = bytes_to_elems(data_sentV);
 
         // Drawing with replacement lets a rank pick the same partner twice,
@@ -393,49 +394,28 @@ SampleLists sampledLists(Pattern &pattern, int comm_rank, int comm_size) {
     return lists;
 }
 
-// Draws one sample from this rank's own Vernier histograms, as Vernier's
-// generate_events_combined does: the rank's recorded number of sends, each to a
-// partner drawn from its neighbors histogram (which counts the partners it received
-// from as well) and with a size drawn from its buffer_size histogram. The combined
-// histograms do not pair partners with sizes, so the two are drawn independently.
-SampleLists fineLists(const FinePattern &pattern) {
-    std::vector<int> neighbors;
-    std::vector<int> neighbors_data;
-    std::vector<int> neighbors_bytes;
-    std::set<int> seen_neighbors;
-    const int reachable_targets = static_cast<int>(pattern.neighbors.size());
-
-    for (int i = 0; i < pattern.sends; ++i) {
-        int data_sentV = sample_interpolated(pattern.size_edges, pattern.size_counts);
-
-        // As in sampledLists: --distinct-neighbors redraws a partner already drawn,
-        // while the histogram still has an unused one.
-        const bool avoid_duplicates =
-            distinct_neighbors
-            && static_cast<int>(seen_neighbors.size()) < reachable_targets;
-
-        int node = -1;
-        do {
-            node = sample_from_map(pattern.neighbors);
-        } while (avoid_duplicates && seen_neighbors.count(node) > 0);
-
-        seen_neighbors.insert(node);
-        neighbors.push_back(node);
-        neighbors_data.push_back(bytes_to_elems(data_sentV));
-        neighbors_bytes.push_back(data_sentV);
+// This rank's recorded sends (EXPORT) or receives (IMPORT) from its own Vernier
+// records, each with its recorded partner (fine_messages). With IMPORT a rank's
+// ids index the owner's elements, so every rank holds as many elements as the
+// largest message on any rank.
+SampleLists fineLists(const FinePattern &pattern, halo_t type) {
+    const std::vector<std::pair<int, int>> messages = fine_messages(pattern, type);
+    int local_max = 0;
+    for (const auto &[partner, bytes] : messages) {
+        local_max = std::max(local_max, bytes_to_elems(bytes));
     }
 
     SampleLists lists;
-    for (std::size_t m = 0; m < neighbors.size(); ++m) {
-        lists.num_tuple = std::max(lists.num_tuple, neighbors_data[m]);
-        for (int i = 0; i < neighbors_data[m]; ++i) {
+    MPI_Allreduce(&local_max, &lists.num_tuple, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+    for (const auto &[partner, bytes] : messages) {
+        for (int i = 0; i < bytes_to_elems(bytes); ++i) {
             lists.ids.push_back(i);
-            lists.ranks.push_back(neighbors[m]);
+            lists.ranks.push_back(partner);
         }
+        lists.partners.push_back(partner);
+        lists.partner_bytes.push_back(bytes);
     }
-    lists.partners = neighbors;
-    lists.partner_bytes = neighbors_bytes;
-    lists.drawn_neighbors = pattern.sends;
+    lists.drawn_neighbors = static_cast<int>(messages.size());
     return lists;
 }
 
@@ -493,7 +473,7 @@ void run_benchmark() {
     for (const std::string &name : names) {
         for (int sample_iter = 0; sample_iter < nsamples; sample_iter++) {
             const SampleLists lists = matrix_input ? matrixLists(halo_type)
-                                      : fine_input ? fineLists(fine_pattern)
+                                      : fine_input ? fineLists(fine_pattern, halo_type)
                                                    : sampledLists(patterns.at(name), comm_rank, comm_size);
             const int nneighborsV = lists.drawn_neighbors;
             const int numberOfmessages = static_cast<int>(lists.partners.size());
