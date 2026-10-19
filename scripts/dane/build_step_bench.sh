@@ -56,13 +56,24 @@ if [ -n "${BENCH_SRC:-}" ]; then
 else
     git -C $BENCH archive ${BENCH_COMMIT:-HEAD} | tar -x -C $ROOT/bench-src
 fi
+if [ -n "${BENCH_SRC:-}" ]; then
+    SOURCE_COMMIT="uncommitted: $BENCH_SRC"
+else
+    SOURCE_COMMIT=$(git -C $BENCH rev-parse "${BENCH_COMMIT:-HEAD}^{commit}")
+fi
 if grep -q MPIL_Set_split $LA_HDR; then
     echo "split=yes" >> $ROOT/commit.txt
 else
     patch -s -p1 -d $ROOT/bench-src < $HOME/cand/cli-nosplit.patch
     echo "split=no" >> $ROOT/commit.txt
+    SOURCE_COMMIT="$SOURCE_COMMIT + cli-nosplit.patch"
 fi
+LA_COMMIT=$(git -C $ENV/localityaware rev-parse "$COMMIT^{commit}")
+[ -n "$LA_PATCH" ] && LA_COMMIT="$LA_COMMIT + $(basename $LA_PATCH)"
+# Compiled into the binary (src/CMakeLists.txt), so provenance.sh reads it from there.
+echo "source_commit=$SOURCE_COMMIT" >> $ROOT/commit.txt
 cmake -S $ROOT/bench-src -B $ROOT/bench-build -DCMAKE_BUILD_TYPE=Release \
+  -DSOURCE_COMMIT="$SOURCE_COMMIT" -DLOCALITY_AWARE_COMMIT="$LA_COMMIT" \
   -DCMAKE_C_COMPILER=$GCC/gcc -DCMAKE_CXX_COMPILER=$GCC/g++ $MPI_ARGS \
   -DCMAKE_CXX_FLAGS="-march=sapphirerapids" \
   -DCabana_DIR=$ROOT/cab-install/share/cmake/Cabana -DKokkos_DIR=$KOKKOS_DIR \
@@ -78,4 +89,5 @@ grep -q "spack-env/view" $ROOT/bench-build/src/CMakeFiles/irregular-benchmarking
 grep -q "$ROOT/cab-install" $ROOT/bench-build/src/CMakeFiles/irregular-benchmarking.dir/flags.make || { echo "[$LABEL] benchmark not using step Cabana headers"; exit 1; }
 ldd $ROOT/bench-build/src/irregular-benchmarking | grep -q "openmpi-4.1.2-gcc-13.3.1/lib/libmpi.so" || { echo "[$LABEL] benchmark does not link Open MPI 4.1.2"; exit 1; }
 ldd $ROOT/bench-build/src/irregular-benchmarking | grep -q mvapich && { echo "[$LABEL] benchmark links mvapich2"; exit 1; }
-echo "[$LABEL] benchmark built ($(tail -1 $ROOT/commit.txt)): $ROOT/bench-build/src/irregular-benchmarking"
+strings $ROOT/bench-build/src/irregular-benchmarking | grep -Fxq "PROVENANCE: source=$SOURCE_COMMIT locality_aware=$LA_COMMIT" || { echo "[$LABEL] binary lacks the expected PROVENANCE line"; exit 1; }
+echo "[$LABEL] benchmark built ($(grep '^split=' $ROOT/commit.txt), source $SOURCE_COMMIT): $ROOT/bench-build/src/irregular-benchmarking"

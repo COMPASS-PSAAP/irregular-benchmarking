@@ -19,5 +19,9 @@ int seed = -1;
 bool unique_seed = false;
 int data_sent_max = -1;
 
+std::string iter_prefix = "";
+bool iter_raw = false;
+bool iter_compressed = false;
+
 int nosy_percent = 0;
 int nosy_time_ms = 0;

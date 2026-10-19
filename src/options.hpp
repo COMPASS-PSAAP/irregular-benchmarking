@@ -47,6 +47,11 @@ extern int seed;
 extern bool unique_seed;
 extern int data_sent_max;
 
+// Per-iteration timing files (--iter-prefix; empty: none written)
+extern std::string iter_prefix;
+extern bool iter_raw;
+extern bool iter_compressed;
+
 // Noisy-neighbor options
 extern int nosy_percent;
 extern int nosy_time_ms;

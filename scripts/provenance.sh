@@ -84,6 +84,49 @@ is_checkout() {
     } > "$base.fabric.txt" 2>&1
     echo "raw fabric queries: $base.fabric.txt"
 
+    section "nodes"
+    # Read on every node inside the job, since compute nodes can differ from the login
+    # node and from each other: clock source, CPU frequency setting, network devices.
+    # One "host<TAB>field<TAB>value" line each; the script stays next to its output.
+    cat > "$base.nodes.sh" <<'NODE_EOF'
+h=$(hostname -s)
+p() { printf '%s\t%s\t%s\n' "$h" "$1" "$2"; }
+cs=/sys/devices/system/clocksource/clocksource0
+p clocksource "$(cat $cs/current_clocksource 2>/dev/null || echo missing)"
+p clocksources_available "$(cat $cs/available_clocksource 2>/dev/null || echo missing)"
+cf=/sys/devices/system/cpu/cpu0/cpufreq
+p cpufreq_driver "$(cat $cf/scaling_driver 2>/dev/null || echo missing)"
+p cpufreq_governor "$(cat $cf/scaling_governor 2>/dev/null || echo missing)"
+p cpufreq_khz "min $(cat $cf/scaling_min_freq 2>/dev/null || echo ?) max $(cat $cf/scaling_max_freq 2>/dev/null || echo ?) cpuinfo_max $(cat $cf/cpuinfo_max_freq 2>/dev/null || echo ?)"
+p no_turbo "$(cat /sys/devices/system/cpu/intel_pstate/no_turbo 2>/dev/null || echo missing)"
+p cpu_model "$(lscpu 2>/dev/null | sed -n 's/^Model name:[[:space:]]*//p')"
+# A snapshot only: the current frequency of every CPU while nothing else of ours runs.
+p cur_freq_khz_min_median_max "$(cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq 2>/dev/null | sort -n | awk '{a[NR]=$1} END {if (NR) print a[1], a[int((NR+1)/2)], a[NR]; else print "missing"}')"
+devs=
+for d in /sys/class/infiniband/*; do
+    [ -e "$d" ] || continue
+    ports=
+    for pt in "$d"/ports/*; do
+        ports="$ports port $(basename "$pt"): $(cat "$pt/state") $(cat "$pt/phys_state") $(cat "$pt/rate") $(cat "$pt/link_layer");"
+    done
+    p ib_device "$(basename "$d") fw $(cat "$d/fw_ver" 2>/dev/null) ($(cat "$d/node_desc" 2>/dev/null)):$ports"
+    devs="$devs $(basename "$d")"
+done
+p ib_devices "${devs:- none}"
+p ucx_transports "$(ucx_info -d 2>/dev/null | awk '/Transport:/ {t = $3} /Device:/ {print t "/" $3}' | sort -u | tr '\n' ' ' || true)"
+p fi_providers "$(fi_info -l 2>/dev/null | grep ':$' | tr -d ':' | tr '\n' ' ' || true)"
+lspci 2>/dev/null | grep -Ei 'infiniband|omni-path|fabric|network controller|ethernet' | while read -r line; do p pci "$line"; done
+NODE_EOF
+    srun --ntasks-per-node=1 --nodes="${SLURM_JOB_NUM_NODES:-1}" bash "$base.nodes.sh" 2>&1 | sort > "$base.nodes.txt"
+    echo "per-node facts (host field value): $base.nodes.txt, from $base.nodes.sh"
+    # Each field's distinct values with how many nodes had them, so an odd node stands out.
+    for field in clocksource cpufreq_driver cpufreq_governor cpufreq_khz no_turbo cpu_model ib_devices ib_device \
+        ucx_transports fi_providers pci; do
+        echo "$field:"
+        awk -F'\t' -v f="$field" '$2 == f && !seen[$1 FS $3]++ {n[$3]++} END {for (v in n) printf "  %s  [%d nodes]\n", v, n[v]}' \
+            "$base.nodes.txt" | sort
+    done
+
     section "benchmark build"
     echo "binary: $bin"
     echo "binary sha256: $(sha256sum "$bin" | cut -d' ' -f1)"
@@ -110,6 +153,13 @@ is_checkout() {
         src=""
     fi
 
+    section "binary provenance"
+    # The commits CMake compiled into the binary (src/CMakeLists.txt); binaries built
+    # before 2026-10-15 have none.
+    echo "$(strings "$bin" | grep -m1 '^PROVENANCE: ' || echo 'PROVENANCE: none in this binary')"
+    echo "linked libraries (ldd):"
+    ldd "$bin" 2>&1 | sed 's/^[[:space:]]*/  /'
+
     section "benchmark source"
     if is_checkout "$src"; then
         echo "source: $src"
@@ -130,6 +180,10 @@ is_checkout() {
         ompi_info=$(dirname "$(dirname "$libmpi")")/bin/ompi_info
         if [ -x "$ompi_info" ]; then
             echo "ompi_info: $("$ompi_info" --version | head -1)"
+            # What this Open MPI could use; which pml/mtl/btl a run picks is not recorded here.
+            for kind in pml mtl btl; do
+                echo "available $kind components: $("$ompi_info" | awk -v k="MCA $kind:" 'index($0, k) {print $3}' | tr '\n' ' ')"
+            done
         fi
     fi
 
@@ -138,6 +192,14 @@ is_checkout() {
         spack_bin=$(command -v spack || echo "$HOME/spack/bin/spack")
         echo "environment: $PROV_SPACK_ENV"
         "$spack_bin" -e "$PROV_SPACK_ENV" find -lp --no-groups localityaware cabana kokkos 2>&1
+        # The environment's installs describe the binary only if it links them; the dane
+        # build scripts link their own locality_aware builds instead.
+        la_lib=$(ldd "$bin" | awk '/locality_aware|mpi_advance/{print $3; exit}')
+        case $la_lib in
+            "") echo "binary's locality_aware: not a shared library of the binary; see PROVENANCE above" ;;
+            */spack/opt/spack/*) echo "binary's locality_aware: $la_lib (a Spack install)" ;;
+            *) echo "binary's locality_aware: $la_lib (NOT a Spack install: the localityaware lines above do not describe this binary; see PROVENANCE above)" ;;
+        esac
         # The installed build is what the binary contains; a dev checkout edited after
         # install (see its dirty state) does not describe it.
         for pkg in localityaware cabana; do

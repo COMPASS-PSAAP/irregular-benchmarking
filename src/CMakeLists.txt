@@ -21,11 +21,53 @@ set(HEADERS
 
 add_executable( irregular-benchmarking ${SOURCES} ${HEADERS} )
 
+# zlib compresses the per-iteration timing files (--iter-prefix).
+find_package(ZLIB REQUIRED)
+
 target_link_libraries( irregular-benchmarking
         Cabana::Core
         Cabana::Grid
         MPI::MPI_CXX
+        ZLIB::ZLIB
         )
+
+# The commits the binary is built from, compiled in as one string that strings(1) finds
+# (scripts/provenance.sh) and printed under -r. The dane build scripts pass both.
+# Otherwise SOURCE_COMMIT is read from git, at configure time only, and only when the
+# source is the top of its own checkout: a git-archive export inside another repository
+# (a home directory that is a repo) must not report that repository's commit.
+set(SOURCE_COMMIT "" CACHE STRING "Commit this source is; empty: read from git at configure time")
+set(LOCALITY_AWARE_COMMIT "" CACHE STRING "locality_aware commit the binary links; empty: unknown")
+set(resolved_commit "${SOURCE_COMMIT}")
+if (resolved_commit STREQUAL "")
+    set(resolved_commit "unknown (not a git checkout)")
+    find_package(Git QUIET)
+    if (GIT_FOUND)
+        execute_process(COMMAND ${GIT_EXECUTABLE} rev-parse --show-toplevel
+                WORKING_DIRECTORY ${PROJECT_SOURCE_DIR} RESULT_VARIABLE git_status
+                OUTPUT_VARIABLE git_top OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+        get_filename_component(git_top "${git_top}" REALPATH)
+        get_filename_component(source_dir "${PROJECT_SOURCE_DIR}" REALPATH)
+        if (git_status EQUAL 0 AND git_top STREQUAL source_dir)
+            execute_process(COMMAND ${GIT_EXECUTABLE} rev-parse HEAD
+                    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+                    OUTPUT_VARIABLE resolved_commit OUTPUT_STRIP_TRAILING_WHITESPACE)
+            execute_process(COMMAND ${GIT_EXECUTABLE} status --porcelain --untracked-files=no
+                    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR} OUTPUT_VARIABLE git_changes)
+            if (NOT git_changes STREQUAL "")
+                string(APPEND resolved_commit "-dirty")
+            endif()
+        endif()
+    endif()
+endif()
+set(resolved_la_commit "${LOCALITY_AWARE_COMMIT}")
+if (resolved_la_commit STREQUAL "")
+    set(resolved_la_commit "unknown")
+endif()
+message(STATUS "Provenance: source ${resolved_commit}, locality_aware ${resolved_la_commit}")
+target_compile_definitions(irregular-benchmarking PRIVATE
+        "BENCH_SOURCE_COMMIT=\"${resolved_commit}\""
+        "LOCALITY_AWARE_COMMIT=\"${resolved_la_commit}\"")
 
 #
 ##CALIPER_start
