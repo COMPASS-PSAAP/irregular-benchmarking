@@ -42,7 +42,7 @@ section() { printf '\n== %s\n' "$1"; }
 # some other repository (e.g. a git-archive export under a home directory that is
 # itself a repo) must not be reported as that repository.
 is_checkout() {
-    [ -n "$1" ] && [ "$(git -C "$1" rev-parse --show-toplevel 2>/dev/null)" = "$(readlink -f "$1")" ]
+    [ -d "$1" ] && [ "$(git -C "$1" rev-parse --show-toplevel 2>/dev/null)" = "$(readlink -f "$1")" ]
 }
 
 {
