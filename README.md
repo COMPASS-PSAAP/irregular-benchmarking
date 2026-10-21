@@ -495,6 +495,15 @@ folder that holds a pulled campaign, or pass the folders as arguments.
   `replay_similarity.py` compares the t<n>.json profiles and their replay with
   it. `replay_similarity.py` reads its inputs from the PyCharm project path set
   at its `PROJECT` line.
+- `five-way-40/` (October 2026): the analysis of the 40-launch five-way
+  campaign (`data-10-13-2026-five-way-40`), laid out like the folder it ran in.
+  Put `analysis/`, `results/`, and the document folders beside a `data/` that
+  holds the pulled campaign as `data/campaign/`, then run `python run_all.py` in `analysis/` (also needs
+  reportlab); it rewrites `results/` (tables, figures, and
+  `five-way-campaign-report.pdf` built from `results/SUMMARY.md`). `paper/`,
+  `report/`, `methodology/`, and `fiveway-report/` hold LaTeX sources whose
+  figures come from `results/figures_nocap/`; `PROMPT.md` is the brief the
+  analysis started from.
 
 ## Layout
 

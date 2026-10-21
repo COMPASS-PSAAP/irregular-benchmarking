@@ -1,0 +1,568 @@
+\documentclass[11pt]{article}
+\usepackage[letterpaper,margin=1in]{geometry}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{amsmath}
+\usepackage{xcolor}
+\usepackage[hidelinks]{hyperref}
+\usepackage[capitalise,nameinlink]{cleveref}
+\usepackage{caption}
+\captionsetup{font=small,labelfont=bf}
+\graphicspath{{../results/figures_nocap/}}
+
+% Every number below carries a "% src:" comment naming the table it comes from, under
+% results/tables/ unless stated. Regenerate the tables with analysis/run_all.py.
+
+\newcommand{\pmrep}{\texttt{.pm} replay}
+
+\title{Evaluating Whether Vernier-Driven Pattern Replay Predicts\\ABCG's Choice of Halo-Exchange Strategy on Dane}
+\author{Nicholas Bacon\\University of New Mexico}
+\date{October 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Choosing a halo-exchange strategy once, at program launch, pays off only if a cheap
+measurement predicts which strategy the application itself would choose. However, to
+our knowledge no one has measured whether a Vernier characterization of an
+application, replayed through a communication benchmark, makes the same choice as the
+application. In this paper we measure how well four stand-ins choose among three
+halo-exchange strategies (plain MPI point-to-point, MPI Advance neighbor alltoallv, and
+MPI Advance locality-aware aggregation) for ABCG's conjugate gradient (CG) iteration.
+The four stand-ins are a replay of Vernier's aggregate histograms, a replay of Vernier's
+per-rank capture, a replay of the exact matrix halo, and ABCG's own SpMV exchange. We
+ran 40 separate allocations at each of 2, 4, 8, and 16 nodes of LLNL's Dane system on
+six SuiteSparse matrices. ABCG's SpMV exchange chooses an arm within 4.2\% of CG's best
+at all 24 combinations of matrix and node count. The exact-matrix replay and the per-rank
+Vernier replay stay within 10\% at 23 and 22 of the 24; every choice that costs CG more
+than 5\% ranks the aggregating strategy too low, and the exact-matrix replay misses
+exactly where CG's gain from aggregation is at most 1.21 times. The aggregate-histogram
+replay chooses differently from the per-rank replay at 4 of the 24 combinations, all at
+2 and 4 nodes, where CG takes up to 32.3 times as long per iteration on its choice.
+Every stand-in prefers MPI Advance's non-aggregating alltoallv where CG is fastest on
+plain MPI, at a cost of at most 4.2\%. Finally, 266 of 9,600 MPI and STANDARD runs lost
+whole multiples of 0.160\,s inside the timed loop; these stalls decide CG's arm ordering
+on the crankseg matrices at 2 nodes, and the aggregate-histogram replay almost never
+shows them. We have not identified their cause.
+\end{abstract}
+
+\section{Introduction}
+
+No single halo-exchange strategy is fastest for every sparse workload. Collom, Li, and
+Bienz showed, at operator level, that the best of direct point-to-point exchange and
+locality-aware aggregation changes across the levels of one algebraic multigrid
+hierarchy~\cite{collom2023}. The research plan this work belongs to proposes a decision
+framework that chooses a strategy once per program launch from a small vector of
+cheaply measured pattern features, and judges that framework by its worst-case regret,
+the largest slowdown a wrong choice causes~\cite{researchplan}. Vernier records such
+features at scale as histograms of message size and logical neighbor distance, keyed by
+neighbor count, kept per rank or merged across ranks~\cite{vernier2025}. The
+irregular-benchmarking replay benchmark regenerates a communication pattern from a
+Vernier capture and times it under different strategies.
+
+However, a Vernier capture is a lossy summary of the pattern. The aggregate data manager
+keeps one histogram set for the whole job, and even the per-rank hierarchical manager
+keeps counts and sizes but not which matrix entries move. Whether a replay built from
+either capture ranks the strategies the way the application does is the plan's
+hypothesis H17, and whether the cheaper aggregate capture suffices is H18; to our
+knowledge neither had been measured. The plan also predicts, before any data, that
+replay will order the non-aggregating strategies correctly and degrade on the
+aggregating one, because aggregation depends on the mapping of ranks to NUMA domains and
+nodes, which a histogram of logical neighbor distance does not record.
+
+This paper measures, for ABCG's CG iteration on Dane, how much CG slows down when each
+of four stand-ins chooses the strategy instead of CG itself. By \emph{stand-in} we mean
+a cheaper measurement that exchanges a version of the SpMV halo of the same matrix at
+the same node count; each stand-in in this study is one step further from CG than the
+one before it. The stand-ins do not reproduce the allreduces or the computation in CG.
+This paper makes the following contributions:
+\begin{itemize}
+\item The identification of a timing anomaly on Dane, in which some MPI and STANDARD
+  runs lose whole multiples of 0.160\,s inside the timed loop, and an account of which
+  stand-ins show it (\cref{sec:stalls});
+\item A step-by-step comparison of what each stand-in changes about the pattern and
+  about the time per iteration (\cref{sec:steps});
+\item An evaluation of each stand-in's strategy choice against CG's own choice by
+  decision regret over 40 allocations per configuration (\cref{sec:regret,sec:matters});
+\item A set of bounded conclusions about when the replay benchmark can stand in for
+  ABCG's CG (\cref{sec:discussion}).
+\end{itemize}
+\Cref{sec:standins} describes the stand-ins and the strategies, \cref{sec:setup} the
+experimental setup, \cref{sec:limits} what this data cannot show, and
+\cref{sec:conclusion} concludes.
+
+\section{The Stand-Ins and the Strategies}
+\label{sec:standins}
+
+We compare five ways of exchanging the SpMV halo of a matrix, ordered from the run we
+care about to the cheapest stand-in. All five exchange the halo of the same matrix,
+partitioned into one contiguous block of rows per MPI rank.
+
+\paragraph{ABCG CG (the reference):} ABCG's \texttt{benchmark\_cg\_pilot} runs CG
+iterations~\cite{abcg}, each consisting of an SpMV with its halo exchange, two
+allreduces, and vector updates, with no barrier between iterations. We treat its time
+per iteration as the true run. On all six matrices CG reached ABCG's 500-iteration cap
+without converging, so these are fixed-iteration timings, not time to solution.
+% src: audit.csv cg_runs_reference_iters_500 = cg_runs at every node count
+
+\paragraph{ABCG SpMV exchange:} ABCG's \texttt{benchmark\_spmv} runs CG's
+pack-and-exchange code followed by a barrier, without the local multiply, the
+allreduces, or the vector updates.
+
+\paragraph{\pmrep:} irregular-benchmarking reads the matrix, builds the same halo, and
+exchanges it through Cabana's gather, with a barrier after every exchange and no
+computation. In all 2,880 paired runs, the minimum, maximum, and average over ranks of
+its messages and bytes sent equal ABCG's exactly; it differs from the ABCG SpMV exchange
+in code path. For STANDARD and LOCALITY it calls MPI Advance's persistent-request
+(\texttt{\_INIT}) neighbor alltoallv; its run headers also report
+``\texttt{persistent: false}'', a setting whose meaning in the benchmark we have not
+confirmed.
+% src: results/runs.csv, pm vs abcgspmv numberOfmessages/data_sent min/max/avg, 0 mismatches in 2,880 pairs; run headers "-alltoallv: NEIGHBOR_ALLTOALLV_INIT_*", "-persistent: false"
+
+\paragraph{Fine replay:} irregular-benchmarking reads a Vernier \emph{hierarchical}
+capture, which records for each rank the number of elements sent to each partner. The
+capture comes from one exchange of ABCG's SpMV at the same node count. Each rank sends
+its recorded number of elements to its recorded partners; the minimum, maximum, and
+average over ranks of its messages, bytes, on- and off-node bytes, and same- and
+other-NUMA bytes equal the \pmrep's in every run. It does not send the same matrix
+entries, so its memory access pattern differs from the \pmrep's.
+% src: audit.csv fine_vs_pm_mismatched_values = 0 at every node count
+
+\paragraph{Coarse replay:} irregular-benchmarking reads Vernier's \emph{aggregate}
+histograms, one histogram set for the whole job. Each rank samples a neighbor count,
+distinct partners by logical neighbor distance, and message sizes within histogram bins
+from these job-wide histograms, and draws a new pattern in every run. It does not
+record which rank sends what or which ranks share a NUMA domain.
+
+\paragraph{Strategies:} Each stand-in runs three strategies, which we call
+\emph{arms}. \textbf{MPI} is plain MPI point-to-point. \textbf{STANDARD} is MPI
+Advance's neighbor alltoallv without aggregation~\cite{mpiadvance2023}.
+\textbf{LOCALITY} is MPI Advance's locality-aware neighbor alltoallv, which aggregates
+messages through NUMA-region leaders (\texttt{-s NUMA}); it is the only aggregating arm.
+ABCG uses persistent requests for STANDARD and LOCALITY. The campaign also ran ABCG with
+one non-persistent MPI Advance call per exchange; its LOCALITY exchange takes 0.31 to 54
+times as long as the persistent one, so we treat it as a different strategy and leave it
+out of this paper.
+% src: ratios.csv stand_in=abcgspmv reference=abcgspmvnp arm=LOCALITY slow_runs=kept, 1/max median_ratio = 0.31, 1/min = 53.7
+
+\section{Experimental Setup}
+\label{sec:setup}
+
+\paragraph{Machine and software:} We ran on Dane at LLNL with 112 MPI ranks per node,
+each bound to its own core, at 2, 4, 8, and 16 nodes (224 to 1,792 ranks), in the
+shared \texttt{pbatch} queue. We excluded nodes dane261 and dane764, which report 2 NUMA
+domains instead of 8 and crash LOCALITY. The software was Open MPI 4.1.2, gcc 13.3.1,
+MPI Advance \texttt{locality\_aware} commit 752a19b, irregular-benchmarking 2593e29,
+ABCG 29953fe, and Vernier 09d650b.
+% src: provenance_*.txt (distinct CPU sets: 112 per node), data/README.txt
+
+\paragraph{Matrices:} We used six SuiteSparse matrices: crankseg\_2 (63,838 rows,
+14.1M nonzeros), nd12k (36,000 rows, 14.2M nonzeros), x104 (108,384 rows, 10.2M
+nonzeros), crankseg\_1 (52,804 rows, 10.6M nonzeros), m\_t1 (97,578 rows, 9.8M
+nonzeros), and nd24k (72,000 rows, 28.7M nonzeros).
+% src: run file headers ("-matrix:" line)
+
+\paragraph{Procedure:} For each node count, a pilot job first captured each matrix's
+SpMV halo with Vernier, then ran every kind on every matrix on STANDARD to choose an
+iteration count $n$ that takes about 10\,s; all three arms use that $n$. Each run warms
+up connections to ranks $r\pm1$ without timing, performs $k=25$ startup iterations,
+which $q$ excludes, and then performs $n$ timed iterations. Forty launches per node
+count, each a separate Slurm allocation, ran every combination of 7 kinds (the four
+stand-ins, CG, and the two non-persistent ABCG kinds), 6 matrices, and 3 arms, 126 runs
+per launch, each launch in its own random order with one \texttt{srun} per run. At most
+four launches of one node count ran at once, and up to 16 overall; the 160 launches ran
+over 23.7 hours. Every run exited normally, every benchmark MPI Advance run verified its
+ghost values against plain MPI, and no ABCG SpMV run reported a wrong halo value.
+% src: audit.csv (exit_nonzero, verify_fail, bench_mpia_runs_without_pass, abcg_check_failed all 0); runs.csv (start/end: span 23.7 h, max 16 concurrent launches)
+
+\paragraph{Metric:} The time per iteration $q$ of a run is its total timed time,
+maximized over ranks, divided by $n$. Because each timed iteration ends at a barrier or
+an allreduce, the minimum and maximum over ranks differ by at most 0.74\%.
+% src: audit.csv rank_spread_timedTotal_max max over node counts = 0.007373
+
+\paragraph{Statistics:} The unit of replication is the launch, because runs within a
+launch share an allocation. For a stand-in $s$ and a reference $r$ at one matrix and
+node count, the stand-in chooses the arm with the lowest median $q_s$ over launches,
+and its \emph{decision regret} is
+\begin{equation}
+  \mathrm{regret} = \frac{\mathrm{median}\, q_r(\text{stand-in's arm})}{\min_a \mathrm{median}\, q_r(a)} - 1 .
+\end{equation}
+A regret of 0 means the stand-in chose the reference's fastest arm, and a regret of
+0.21 means the reference takes 21\% longer per iteration on the stand-in's choice. This
+is the launch-time setting of the plan, in which one choice is made per program and
+configuration. Intervals come from resampling launches with replacement (10,000
+resamples), which keeps each launch's runs together. To summarize the results we call
+a stand-in \emph{useful for choosing an arm for CG} where its decision regret on CG is
+at most 10\% at every combination of matrix and node count. The 10\% figure is the
+equivalence margin we fixed before computing any result; applying it to decision regret
+is a choice we made after seeing the regrets.
+
+\section{Some MPI and STANDARD Runs Lose Whole 0.160-Second Stalls}
+\label{sec:stalls}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.78\linewidth]{stall_quantum_excess_fine_crankseg_2_STANDARD_16nodes.png}
+\caption{Extra timed time of each of 40 launches of the fine replay of crankseg\_2 on
+STANDARD at 16 nodes ($n=57$ timed iterations), relative to the fastest launch, in
+units of 0.160\,s. Every bar falls on a whole number.}
+\label{fig:stallhist}
+\end{figure}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.78\linewidth]{stall_quantum_coherence_by_cell.png}
+\caption{Phase coherence of the launch-to-launch differences in total timed time with a
+0.160\,s period (1 = every difference is a multiple of 0.160\,s; about 0.1 = no
+pattern), for each of the 447 combinations of node count, kind, matrix, and arm whose
+total varies by at least 0.3\,s across its 40 launches. Points above the dashed line
+(0.5) are almost all MPI or STANDARD.}
+\label{fig:stallcoh}
+\end{figure}
+
+We report this effect first because it shapes the crankseg and 2-node results below.
+For each combination of node count, kind, matrix, and arm whose total timed time varies
+by at least 0.3\,s across launches (447 of them), we measured the phase coherence of
+the pairwise launch-to-launch differences against candidate periods from 0.08 to
+0.30\,s. In 61 combinations the best coherence exceeds 0.5 (from 0.53 up to 0.995);
+their best periods have a median of 0.1600\,s and an interquartile range of 0.1600 to
+0.1605\,s (\cref{fig:stallhist,fig:stallcoh}). In these combinations, slow runs lose a
+whole number of 0.160\,s stalls rather than running uniformly slower; in the worst
+launches of \cref{fig:stallhist}, 56 stalls fall within 57 timed iterations. 22 of the
+61 combinations are of the non-persistent ABCG kinds.
+% src: stall_quantum.csv (447 rows; 61 with coherence > 0.5, min 0.53; best_period_s median and IQR; max coherence 0.9952; 22 of 61 abcg*np)
+
+We flagged as slow every run whose $q$ exceeds five times the median of its
+combination. Among the kinds this paper studies, 266 of 9,600 MPI and STANDARD runs are
+flagged: 76 of the \pmrep, 98 of the fine replay, 90 of ABCG's SpMV exchange and CG, and
+2 of the coarse replay. No LOCALITY run of these kinds is flagged. The slow runs fall on
+crankseg\_1 and crankseg\_2 at every node count, on nd24k at 4 to 16 nodes, and on nd12k
+at 8 and 16 nodes. The \pmrep{} and the fine replay have slow runs in 18 combinations of
+node count, matrix, and arm, and the persistent ABCG kinds in 16, of which 11 are
+shared. The stalls also set $n$. At 16 nodes, the pilot's STANDARD run of the fine
+replay of crankseg\_2 measured 142.8\,ms per iteration, so the pilot chose $n=57$. The
+fastest MPI run of that pattern takes 0.41\,ms per iteration, so its timed loop lasts
+about 23\,ms rather than 10\,s, and each stall adds 2.8\,ms to $q$, about seven times
+the stall-free time; even the fastest STANDARD run (3.2\,ms) contains one stall. Across
+the campaign, the pilot's time per iteration was more than 2 times the fastest later
+STANDARD run's for 47 of the 168 combinations of node count and pattern. On 4-node crankseg\_2, the median MPI and STANDARD $q$ of the \pmrep,
+the fine replay, and ABCG's SpMV exchange is 4 to 23 times the fastest launch's.
+% src: slow_runs.csv / runs.csv slow flag (studied kinds, MPI+STANDARD: 266 of 9,600; pm 76, fine 98, abcgspmv+abcgcg 90, coarse 2; 0 LOCALITY); cell overlap 18/16/11 computed from runs.csv; pilot_01_crankseg_2 file in 8013862-pilot-16
+
+Neither launch start time (Spearman $|\rho| \le 0.12$, $p \ge 0.45$ at every node
+count) nor membership of any one node (124 nodes tested, smallest Bonferroni-corrected
+$p = 0.73$) predicts which launches stall. The kind of the preceding run shows no
+consistent association with stalling. We do not know the cause. The five-times-median
+rule used in the robustness checks below does not remove the stalls in combinations
+where they inflate the median itself.
+% src: launch_stall_score.csv; slow_by_node.csv; slow_by_predecessor.csv
+
+\section{What Each Step Changes}
+\label{sec:steps}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.9\linewidth]{coarse_structure_ratio_4nodes.png}
+\caption{Per-rank pattern quantities of the coarse replay divided by the exact values
+(which the fine replay matches), at 4 nodes. Markers are medians over 40 launches and
+bars span all 40, because the coarse replay draws a new pattern in every run.}
+\label{fig:structure}
+\end{figure}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.78\linewidth]{ladder_time_ratio_vs_cg.png}
+\caption{Time per iteration of each stand-in divided by ABCG CG's on the same arm. Each
+point is one combination of matrix and node count (median over 40 launches of the
+per-launch ratio).}
+\label{fig:timeratio}
+\end{figure}
+
+\paragraph{Coarse to fine replay:} The coarse replay keeps the mean bytes per rank
+within 0.7\% below to 3.1\% above the exact value and the mean message count within
+1.0\%. On crankseg\_1, crankseg\_2, and nd24k at 2 to 16 nodes (medians over launches;
+\cref{fig:structure} shows 4 nodes), however, it sends 0.54 to 0.69 times the exact
+same-NUMA bytes, 0.73 to 0.91 times the on-node bytes, and 1.05 to 1.83 times the
+off-node bytes. On every matrix, its busiest rank sends 1.17 to 2.06 times as many bytes
+as the exact busiest rank. The loss of same-NUMA traffic is consistent with sampling
+partners by logical neighbor distance, which does not record which ranks share a NUMA
+domain; we did not test this explanation. The coarse replay's time per iteration is 0.59
+to 1.17 times the fine replay's on LOCALITY and 0.018 to 1.39 times on MPI and STANDARD.
+The low end on MPI and STANDARD comes from combinations in which the fine replay stalls
+and the coarse replay does not.
+% src: h18_structure.csv (ratio_median ranges over all node counts); ladder_ratio.csv relation=vs_next stand_in=coarse
+
+\paragraph{Fine replay to \pmrep:} On LOCALITY their times agree within 1\% at all 24
+combinations (median per-launch ratio 0.993 to 1.008, equivalent within $\pm 10\%$ at
+all 24). On MPI and STANDARD they are equivalent at 15 of 24 each. The other 18 are not
+shown equivalent (median ratios 0.86 to 1.42), and 13 of them contain a slow run of the
+fine replay or the \pmrep.
+% src: ratios.csv stand_in=fine reference=pm slow_runs=kept; slow-run membership from runs.csv
+
+\paragraph{\pmrep{} to ABCG SpMV exchange:} The two send the same messages and bytes
+(by the minimum, maximum, and average over ranks), so the difference is the code path.
+On LOCALITY the \pmrep{} is 1.49 to 1.99 times slower than ABCG's exchange at every
+combination. The replay calls the locality-aware exchange through Cabana's gather and
+ABCG calls it on its own buffers; we have not isolated which part of the Cabana path
+costs the time. On MPI and STANDARD the ratio is 0.95 to 3.79, equivalent within
+$\pm 10\%$ at 10 and 11 of 24 combinations.
+% src: ratios.csv stand_in=pm reference=abcgspmv slow_runs=kept (LOCALITY 1.488-1.992, 0/24 equivalent; MPI 0.976-3.192, 10/24; STANDARD 0.950-3.786, 11/24)
+
+\paragraph{ABCG SpMV exchange to CG:} A CG iteration adds the local multiply, two
+allreduces, and vector updates to the same pack-and-exchange code, and drops the
+barrier. ABCG's standalone SpMV exchange takes 0.62 to 0.75 times as long as a CG
+iteration on LOCALITY, and 0.39 to 0.97 times as long on MPI and STANDARD
+(\cref{fig:timeratio}).
+% src: ladder_ratio.csv relation=vs_cg stand_in=abcgspmv
+
+No stand-in's time per iteration is a fixed multiple of CG's. Across the 24
+combinations, the \pmrep's time on MPI ranges from 0.44 to 3.26 times CG's, and the
+coarse replay's from 0.035 to 0.80 times (\cref{fig:timeratio}). A stand-in can
+therefore support a launch-time choice only by preserving the order of the arms, which
+the next section measures.
+% src: ladder_ratio.csv relation=vs_cg (pm MPI 0.443-3.260; coarse MPI 0.035-0.798)
+
+\section{Whether Each Stand-In Chooses CG's Arm}
+\label{sec:regret}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.78\linewidth]{ladder_worst_regret_vs_cg.png}
+\caption{Worst-case decision regret of each stand-in on ABCG CG over the 24
+combinations of matrix and node count, and the number of combinations in which the
+regret exceeds 10\% (dashed line). Note the logarithmic axis.}
+\label{fig:worst}
+\end{figure}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{ladder_regret_vs_cg.png}
+\caption{Decision regret of each stand-in on ABCG CG at each combination of node count
+and matrix, with 95\% launch-bootstrap intervals. 40 launches per combination.}
+\label{fig:regretpoints}
+\end{figure}
+
+\begin{table}[t]
+\centering
+\caption{Worst-case decision regret over 24 combinations, scored on CG and on the next
+step toward CG, with 95\% launch-bootstrap intervals. Slow runs kept.}
+\label{tab:ladder}
+\small
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{lllcc}
+\toprule
+Stand-in & Scored on & Worst case at & Worst-case regret (95\% CI) & Over 10\% \\
+\midrule
+ABCG SpMV & CG & 2 nodes, x104 & 4.2\% (3.1--5.1\%) & 0 of 24 \\
+\pmrep & CG & 4 nodes, nd12k & 21\% (19--26\%) & 1 of 24 \\
+Fine replay & CG & 2 nodes, crankseg\_1 & 101\% (0--133\%) & 2 of 24 \\
+Coarse replay & CG & 4 nodes, crankseg\_2 & 3,129\% (1,738--7,357\%) & 6 of 24 \\
+\midrule
+\pmrep & ABCG SpMV & 4 nodes, nd12k & 30\% (27--33\%) & 1 of 24 \\
+Fine replay & \pmrep & 2 nodes, crankseg\_1 & 1.4\% (0--35\%) & 0 of 24 \\
+Coarse replay & Fine replay & 4 nodes, crankseg\_2 & 1,720\% (1,535--4,565\%) & 4 of 24 \\
+\bottomrule
+\end{tabular}
+% src: ladder_regret.csv slow_runs=kept, max decision_regret per (stand_in, relation) and count > 0.10
+\end{table}
+
+Only ABCG's SpMV exchange is useful for choosing an arm for CG by our criterion; its
+choice costs CG at most 4.2\% at any combination (\cref{fig:worst}, \cref{tab:ladder}).
+The \pmrep{} and the fine replay exceed 10\% at one and two combinations, and the coarse
+replay at six. Dropping the runs flagged as slow changes none of these counts; the
+coarse replay's worst case drops to 1,846\%.
+% src: ladder_regret.csv slow_runs=dropped (worst coarse 18.464; over-10% counts unchanged: 0, 1, 2, 6)
+
+\paragraph{Misses involving LOCALITY:} Every choice that costs CG more than 5\%, 12 in
+all, is a stand-in choosing STANDARD where CG is fastest on LOCALITY: 7 by the coarse
+replay, 3 by the fine replay, and 2 by the \pmrep. No stand-in chose LOCALITY where CG
+was fastest without it. These include all three replays at 16-node m\_t1, where CG's
+LOCALITY advantage is 7.1\%. This is the half of the plan's prediction that held. The
+plan's stated reason, a missing rank-to-region mapping, does not explain the
+\pmrep's misses, because the \pmrep{} sends the exact pattern.
+% src: ladder_regret.csv relation=vs_cg slow_runs=kept, decision_regret > 0.05 (12 rows, all STANDARD vs LOCALITY; 16-node m_t1 0.071 for pm, fine, coarse)
+
+\paragraph{The \pmrep:} The \pmrep{} misses at exactly the three combinations where
+CG's LOCALITY advantage is smallest: 1.016, 1.071, and 1.213 times at 16-node x104,
+16-node m\_t1, and 4-node nd12k. It chooses LOCALITY at all 13 combinations where CG's
+advantage is 2.0 times or more; no combination falls between 1.21 and 2.0 times. At
+4-node nd12k, the \pmrep's LOCALITY takes 1.58 times as long as ABCG's while its MPI and
+STANDARD match ABCG's within 3.1\%, which is enough to overturn LOCALITY's 21\% margin in
+CG. On crankseg, part of the \pmrep's correct choice comes from its own stalls. At
+4-node crankseg\_2 its fastest STANDARD launch (0.260\,ms) beats its fastest LOCALITY
+launch (0.365\,ms), and it chooses LOCALITY by median only because its median STANDARD
+time is 23 times its fastest.
+% src: h0_best_arm.csv reference=abcgcg (margin = min(MPI,STANDARD)/LOCALITY medians) joined with ladder_regret.csv pm choices; ratios.csv pm/abcgspmv 4 nd12k (MPI 1.031, STANDARD 1.014, LOCALITY 1.581); runs.csv 4-node crankseg_2 pm min/median q
+
+\paragraph{The fine replay:} The fine replay's choice differs from the \pmrep's only at
+2-node crankseg\_1. There the \pmrep's STANDARD and LOCALITY medians are within 1.4\% of
+each other, so the two replays land on opposite sides of a near-tie: the \pmrep's
+choice flips in 43\% of bootstrap resamples and the fine replay's in 23\%. CG's cost of
+the fine replay's choice there is 101\% (95\% CI 0 to 133\%).
+% src: ladder_regret.csv fine/pm vs_cg 2 crankseg_1 (p_choice_changes 0.229 and 0.4285); fine vs_next 0.0144
+
+\paragraph{The coarse replay:} The coarse replay chooses a different arm from the fine
+replay at 4 of 24 combinations: crankseg\_2 at 2 nodes, and crankseg\_1, crankseg\_2,
+and nd24k at 4 nodes. At 4-node crankseg\_2, CG takes 32.3 times as long per iteration
+on its choice (STANDARD) as on LOCALITY. Its two other misses above 10\% on CG, 2-node
+crankseg\_1 and 4-node nd12k, are shared with the fine replay. The coarse and fine
+replays agree at all 12 combinations at 8 and 16 nodes. The 4-node crankseg\_2 miss is
+not a stall artifact, because CG's fastest STANDARD launch (0.951\,ms) is still 3.3
+times its fastest LOCALITY launch (0.288\,ms). By contrast, at 2 nodes, CG's arms scored
+on their fastest 10\% of launches make MPI fastest on crankseg\_1 and crankseg\_2, and
+the 2-node misses of the coarse and fine replays shrink to at most 2.6\%. This
+fastest-10\% analysis was not planned before we saw the stalls.
+% src: ladder_regret.csv coarse vs_next; h18_coarse_vs_fine.csv nodes >= 8 all 0; runs.csv 4-node crankseg_2 abcgcg min q; h17_p10.csv reference=abcgcg 2-node crankseg (<= 0.026)
+
+\paragraph{Misses between MPI and STANDARD:} The other half of the plan's prediction,
+that replay orders the non-aggregating arms correctly, failed. CG is fastest on MPI at 8
+combinations (2-node nd12k, x104, m\_t1, and nd24k, and 4- and 8-node x104 and m\_t1),
+and at all 8 every stand-in, including ABCG's SpMV exchange, chooses STANDARD. Within
+those combinations the \pmrep{} puts STANDARD ahead of MPI in 90 to 100\% of launches,
+the fine replay in 82 to 100\%, and ABCG's SpMV exchange in 50 to 88\%, while CG puts
+STANDARD ahead in 0 to 60\%. None of the 8 combinations contains a slow run, so stalls
+do not explain this bias, and we have not identified its cause. It costs CG only 0.1 to
+4.2\%, because MPI and STANDARD are close in CG at these combinations.
+% src: ladder_regret.csv vs_cg at the 8 MPI-best combos (all STANDARD); per-launch STANDARD<MPI shares from runs.csv; no slow runs of studied kinds in those combos; h0_best_arm.csv MPI/STANDARD gap 0.001-0.042
+
+\section{Whether the Choice Matters}
+\label{sec:matters}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.85\linewidth]{h0_selection_gain_abcgcg.png}
+\caption{How much faster ABCG CG runs when each workload uses its own fastest arm than
+when every workload uses the single best arm (geometric mean over workloads). The arms
+are chosen on half of the launches and scored on the other half; bars are 95\% ranges
+over 2,000 bootstrap splits.}
+\label{fig:gain}
+\end{figure}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.85\linewidth]{h8_nstar_abcgcg_LOCALITY_vs_MPI.png}
+\caption{Number of CG iterations after which LOCALITY's extra setup cost is repaid,
+against MPI, from medians over 40 launches with 95\% launch-bootstrap intervals. Red
+markers at the top mean LOCALITY never overtakes MPI. Dotted lines mark the 22 and 40
+iterations reported by Collom et al.~\cite{collom2023}.}
+\label{fig:nstar}
+\end{figure}
+
+A stand-in is worth having only where CG's best arm changes between configurations. By
+median, CG is fastest on LOCALITY for crankseg\_1 and crankseg\_2 at every node count,
+for nd12k and nd24k from 4 nodes on, and for m\_t1 and x104 only at 16 nodes; everywhere
+else it is fastest on MPI. Choosing the arm per matrix instead of using the single best
+arm makes CG 28\% (95\% range 8 to 46\%) faster at 2 nodes, 29\% (29.0 to 29.8\%) at 4
+nodes, and 11\% (10 to 12\%) at 8 nodes. At 16 nodes LOCALITY is fastest for all six
+matrices and the gain is 0 (\cref{fig:gain}). Scored on each arm's fastest 10\% of
+launches, CG's best arm is unchanged at every 4- and 8-node combination. At 2 nodes it
+is MPI or STANDARD for every matrix, so the 2-node gain comes from stalls. The data
+therefore supports the plan's H0, that the best arm changes across workloads, at 4 and 8
+nodes, but not at 2 or 16.
+% src: h0_best_arm.csv reference=abcgcg slow_runs=kept; h0_selection_gain.csv reference=abcgcg across=matrices slow_runs=kept; h17_p10.csv reference columns for abcgcg
+
+A launch-time choice of LOCALITY also has to repay LOCALITY's setup. Against MPI, CG
+repays it after 7 to 31 iterations on the crankseg matrices at 4 to 16 nodes, and after
+86 and 103 iterations at 2 nodes. This is the same order as the 22 and 40 iterations
+Collom et al.\ reported at 2,048 cores on a different machine and MPI
+library~\cite{collom2023}. It takes 26 to 83 iterations on nd24k and 70 to 778 on nd12k
+at 4 to 16 nodes, and LOCALITY never overtakes MPI on either at 2 nodes. On m\_t1 and
+x104, LOCALITY never overtakes MPI at 2 to 8 nodes and needs 2,449 (95\% CI 1,968 to
+5,599) and 8,518 (3,389 to 65,722) iterations at 16 nodes (\cref{fig:nstar}). These
+counts exclude the untimed warmup with ranks $r\pm1$.
+% src: h8.csv kind=abcgcg versus=MPI slow_runs=kept
+
+\section{Discussion}
+\label{sec:discussion}
+
+The results above lead us to the following conclusions about when the replay benchmark
+can stand in for ABCG's CG on Dane.
+
+\paragraph{1) Whether to aggregate:} The \pmrep{} chose LOCALITY at every combination
+where CG's advantage from LOCALITY was 2.0 times or more, and missed at all three where
+it was 1.02 to 1.21 times. Applying this requires knowing CG's margin, which is what the
+stand-in is meant to replace, so in practice it means the benchmark cannot be trusted to
+recommend LOCALITY when aggregation's benefit to CG is below some threshold between 1.21
+and 2.0 times. The fine replay missed once even above that range, at a near-tie in the
+replays. On crankseg, the replays' correct choices of LOCALITY rest partly on their own
+stalls; the replays and the persistent ABCG kinds stall in 11 shared combinations of the 23 in which either stalls.
+
+\paragraph{2) MPI versus STANDARD:} Every stand-in, including ABCG's own SpMV exchange,
+prefers STANDARD where CG is fastest on MPI. The bias is systematic, not noise, and its
+cause is unknown. It cost CG 0.1 to 4.2\% here; it would matter more on a workload where
+MPI and STANDARD differ more in CG.
+
+\paragraph{3) The per-rank capture against the matrix:} The fine replay's choice matches
+the \pmrep's at 23 of 24 combinations, and the one difference is a near-tie in both
+replays. Where the matrix is not available, the hierarchical capture is as good an input
+as the matrix for this decision at 224 to 1,792 ranks. However, it stores one file per
+rank (1,792 files at 16 nodes), so its input cost grows with process count.
+% src: ladder_regret.csv fine vs_next (choice differs only at 2-node crankseg_1); data/README.txt (112 x nodes hierarchical files)
+
+\paragraph{4) The aggregate capture at 2 and 4 nodes:} The coarse replay chooses
+differently from the fine replay at 4 of 24 combinations, all at 2 and 4 nodes, at a
+cost to CG of up to 32.3 times the time per iteration. It undercounts same-NUMA bytes and
+overloads the busiest rank by similar factors at 8 and 16 nodes, where it agrees with the
+fine replay, so these distortions do not by themselves explain the disagreements. It also
+almost never stalls. For this decision on Dane, H18 fails for the aggregate manager at 2
+and 4 nodes; the plan states H18 for the combined manager, which this campaign did not
+test.
+
+\paragraph{5) Time per iteration:} No stand-in's time is a fixed multiple of CG's; the
+\pmrep's MPI time ranges from 0.44 to 3.26 times CG's. The stand-ins are therefore useful,
+where at all, only for choosing an arm, not for estimating CG's run time.
+
+In answer to whether the benchmark is useful, ABCG's own SpMV exchange is the only
+stand-in that met our 10\% criterion everywhere. The exact-matrix and per-rank replays
+make the aggregate-or-not decision correctly when aggregation's benefit to CG is large,
+and recommend against aggregating when the benefit is at most 1.21 times, because the
+benchmark's LOCALITY path is 1.49 to 1.99 times slower than ABCG's. The aggregate-histogram
+replay is not usable for this decision at 2 and 4 nodes. No stand-in chooses correctly
+between MPI and STANDARD, though that choice cost CG at most 4.2\% in this data.
+
+\section{What This Data Cannot Show}
+\label{sec:limits}
+
+This campaign leaves several questions open, and each limits the conclusions above.
+First, each run reports only totals over $n$ iterations, so we have no per-iteration
+times, no tail percentiles within a run, and no test of the plan's extreme-value
+hypotheses. Second, the replay benchmark closes every exchange with a barrier and does
+no computation, so it cannot show accumulation of delays across iterations or overlap of
+communication with computation. Third, all data comes from one machine, one MPI library,
+one MPI Advance version, and a shared queue over 23.7 hours; the spread across
+allocations is likely smaller than it would be for allocations weeks apart, and nothing
+here says the arm orderings hold on another machine. We also did not record Dane's
+interconnect. Fourth, the campaign runs three arms rather than the plan's five, no
+one-sided arm, and no combined Vernier manager. Fifth, CG never converged within 500
+iterations on these matrices, so CG time here is time per fixed iteration, not time to
+solution. Finally, we do not know what causes the 0.160\,s stalls, so we cannot say
+whether they belong to Dane, to Open MPI 4.1.2, to these patterns, or to the up to 16
+launches running at once. Timing individual iterations of the 4-node crankseg\_2 MPI runs
+would show whether single iterations take about 160\,ms.
+
+\section{Conclusion}
+\label{sec:conclusion}
+
+In this paper we measured how much ABCG's CG iteration slows down on Dane when each of
+four stand-ins chooses among plain MPI, MPI Advance neighbor alltoallv, and MPI Advance
+locality-aware aggregation, over 40 allocations at each of 2, 4, 8, and 16 nodes and six
+matrices. ABCG's SpMV exchange chose within 4.2\% of CG's best everywhere. The replay of
+the exact matrix halo and the replay of the per-rank Vernier capture chose within 10\% at
+23 and 22 of 24 combinations. The exact-matrix replay missed at exactly the three
+combinations where aggregation's benefit to CG was at most 1.21 times, because the
+benchmark's locality-aware path is 1.49 to 1.99 times slower than ABCG's. The per-rank
+replay matched the exact-matrix replay except at one near-tie. The replay of the
+aggregate Vernier histograms chose differently from the per-rank replay at 4 of 24
+combinations, all at 2 and 4 nodes, where CG took up to 32.3 times as long per iteration
+on its choice. Every stand-in, including ABCG's SpMV exchange, chose STANDARD where CG
+was fastest on MPI, at a cost to CG of 0.1 to 4.2\%. Finally, 266 of 9,600 MPI and
+STANDARD runs lost whole multiples of 0.160\,s inside the timed loop. By median,
+LOCALITY was CG's fastest arm on the crankseg matrices at 2 nodes, but on each arm's
+fastest 10\% of launches MPI was, so these stalls decided that ordering. The aggregate
+replay almost never stalled, and we have not identified the cause of the stalls.
+
+\bibliographystyle{plain}
+\bibliography{references}
+
+\end{document}

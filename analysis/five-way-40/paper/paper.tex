@@ -1,0 +1,639 @@
+\documentclass[11pt]{article}
+\usepackage[letterpaper,margin=1in]{geometry}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{amsmath}
+\usepackage{xcolor}
+\usepackage[hidelinks]{hyperref}
+\usepackage[capitalise,nameinlink]{cleveref}
+\usepackage{caption}
+\captionsetup{font=small,labelfont=bf}
+\graphicspath{{../results/figures_nocap/}}
+
+% Every number below carries a "% src:" comment naming the table it comes from, under
+% results/tables/ unless stated. Regenerate the tables with analysis/run_all.py.
+
+\newcommand{\pmrep}{\texttt{.pm} replay}
+
+\title{Evaluating Halo-Exchange Stand-Ins for Conjugate Gradient\\and the Statistics Used to Judge Them}
+\author{Nicholas Bacon\\University of New Mexico}
+\date{October 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Choosing a halo-exchange strategy for a sparse solver from a cheaper measurement, such as a
+communication benchmark or the solver's own exchange run alone, is worthwhile only if the
+cheaper measurement ranks the strategies the way the solver does and if the statistics
+used to compare strategies can be trusted. However, benchmark run times on shared HPC
+systems are rarely normally distributed, and the stand-ins differ from the solver in code
+path as well as in what they leave out. In this paper we measure both questions on LLNL's
+Dane system, using 40 separate allocations at each of 2, 4, 8, and 16 nodes, six
+SuiteSparse matrices, three strategies (plain MPI point-to-point, MPI Advance neighbor
+alltoallv, and MPI Advance locality-aware aggregation), and seven ways of running the SpMV
+halo exchange, from a replay of Vernier's job-wide histograms up to ABCG's conjugate
+gradient (CG) iteration. Normality is rejected in 86\% of configurations on run time and
+in 62\% on its logarithm, largely because MPI and STANDARD runs lose whole multiples of
+0.160\,s. A paired $t$-test on log time nevertheless keeps close to its nominal 5\% false
+positive rate and replicates its verdicts as well as rank-based tests do, while a $t$-test
+on raw time does not, and with stalls present no test detects a true 10\% difference
+reliably with 40 allocations. ABCG's standalone SpMV exchange reaches the same verdict as
+CG on 62 of 72 strategy pairs, and every disagreement but two is between MPI and
+STANDARD; the matrix replay reaches CG's verdict on 49, because its locality-aware path is
+1.49 to 1.99 times slower than ABCG's on the same messages.
+\end{abstract}
+
+\section{Introduction}
+
+No single halo-exchange strategy is fastest for every sparse workload. Collom, Li, and
+Bienz showed that the best of direct point-to-point exchange and locality-aware
+aggregation changes across the levels of one algebraic multigrid
+hierarchy~\cite{collom2023}, and the research plan this work belongs to proposes choosing
+a strategy once per program launch from cheaply measured pattern
+features~\cite{researchplan}. Such a choice needs two things: a stand-in that runs faster
+than the application but ranks the strategies the same way, and a statistical procedure
+that says when one strategy is faster than another on a machine whose run times vary from
+allocation to allocation. A companion report measured how much ABCG's CG iteration slows
+down when each of four stand-ins makes the choice instead of CG
+itself~\cite{ladderreport}.
+
+However, that report scored stand-ins by comparing medians and did not ask whether the
+statistics behind the comparison were sound, and it left open why the stand-ins disagree
+with CG where they do. Both questions matter beyond this study. The benchmarking
+literature warns against assuming normality without checking it and recommends
+nonparametric summaries~\cite{hoefler2015scientific,maricq2018taming}, but a diagnostic
+check does not say how much a normal-theory test actually errs on a given workload, which
+decides whether its simpler analysis is acceptable. Likewise, a communication benchmark
+used as a stand-in for an application runs a different code path and leaves out the
+application's computation, and which of those differences changes a strategy comparison
+is rarely measured.
+
+This paper evaluates, on the same 40-allocation campaign, which statistical tests give
+reliable verdicts on halo-exchange strategy comparisons, and how well each stand-in
+reproduces the verdicts of the run above it. By \emph{stand-in} we mean a cheaper
+measurement that exchanges a version of the SpMV halo of the same matrix at the same node
+count; we do not consider analytical models or simulators. This paper makes the following
+contributions:
+\begin{itemize}
+\item A comparison, line by line, of what the replay benchmark, ABCG's SpMV exchange, and
+  ABCG's CG iteration execute and time in each iteration (\cref{sec:codepaths});
+\item A characterization of the run-time distributions, including how far they depart from
+  normality and why (\cref{sec:distributions});
+\item A calibration of normal-theory and rank-based tests and intervals against the
+  data's own distribution, measuring false positive rate, power, coverage, sample-size
+  predictions, and replication across allocations (\cref{sec:statistics});
+\item An evaluation, with those tests, of whether each stand-in reproduces the strategy
+  verdicts of the run above it, from the job-wide Vernier replay up to CG
+  (\cref{sec:spmvcg,sec:replay,sec:vernier});
+\item A set of bounded recommendations for comparing communication strategies on shared
+  systems (\cref{sec:discussion}).
+\end{itemize}
+\Cref{sec:background} describes the stand-ins and the strategies, \cref{sec:setup} the
+experiment, \cref{sec:related} related work, and \cref{sec:conclusion} concludes.
+
+\section{Background}
+\label{sec:background}
+
+The remainder of this section describes the three halo-exchange strategies, the seven ways
+of running the exchange that the campaign compares, and the measurement each run reports.
+
+\paragraph{Strategies:} Each run uses one of three strategies, which we call \emph{arms}.
+\textbf{MPI} is plain MPI point-to-point exchange. \textbf{STANDARD} is MPI Advance's
+neighbor alltoallv without aggregation~\cite{mpiadvance2023}. \textbf{LOCALITY} is MPI
+Advance's locality-aware neighbor alltoallv, which gathers each NUMA region's messages to
+another region at a leader rank and sends them as one message (\texttt{-s NUMA}); it is
+the only aggregating arm.
+
+\paragraph{ABCG CG:} ABCG's \texttt{benchmark\_cg\_pilot} runs conjugate gradient on a
+matrix partitioned into one contiguous block of rows per rank~\cite{abcg}. We treat its time
+per iteration as the run the stand-ins are meant to predict. On all six matrices CG
+reached ABCG's 500-iteration cap without converging, so its times are per fixed iteration,
+not time to solution.
+
+\paragraph{ABCG SpMV exchange:} ABCG's \texttt{benchmark\_spmv} runs only CG's
+pack-and-exchange code, once per iteration, followed by a barrier.
+
+\paragraph{\pmrep:} The irregular-benchmarking replay benchmark reads the matrix in
+PETSc-derived \texttt{.pm} format, builds the same block partition and halo, and exchanges
+it through Cabana's halo gather, with a barrier after every exchange and no computation. In
+all 2,880 paired runs, the minimum, maximum, and average over ranks of its messages and
+bytes sent equal ABCG's exactly.
+% src: report.tex sec. 2; results/runs.csv pm vs abcgspmv numberOfmessages/data_sent min/max/avg, 0 mismatches in 2,880 pairs
+
+\paragraph{Fine and coarse replays:} The same benchmark can instead read a Vernier capture
+of one ABCG SpMV exchange~\cite{vernier2025}. The \emph{fine} replay reads Vernier's
+per-rank hierarchical capture and sends each rank's recorded number of elements to its
+recorded partners; its per-rank message and byte counts equal the \pmrep's in every run.
+The \emph{coarse} replay reads Vernier's job-wide aggregate histograms and samples each
+rank's neighbor count, partners, and message sizes from them, drawing a new pattern in
+every run.
+% src: audit.csv fine_vs_pm_mismatched_values = 0 at every node count
+
+\paragraph{Non-persistent ABCG:} The campaign also ran ABCG's SpMV exchange and CG with one
+non-persistent MPI Advance call per exchange instead of a persistent request. We include
+them in the statistical calibration, where they add 144 comparisons, and leave them out of
+the stand-in evaluation, as the companion report did, because their LOCALITY exchange takes
+0.31 to 54 times as long as the persistent one~\cite{ladderreport}.
+% src: ratios.csv stand_in=abcgspmv reference=abcgspmvnp arm=LOCALITY slow_runs=kept (1/max 0.31, 1/min 53.7); 144 = 2 kinds x 72
+
+\paragraph{Metric:} The time per iteration $q$ of a run is its total timed time, maximized
+over ranks, divided by its number of timed iterations $n$. Because each timed iteration
+ends at a barrier or an allreduce, the minimum and maximum over ranks differ by at most
+0.74\%.
+% src: audit.csv rank_spread_timedTotal_max max over node counts = 0.007373
+
+\section{What Each Program Runs and Times}
+\label{sec:codepaths}
+
+The stand-ins send the same messages as ABCG, but they do not execute the same code. This
+section lists what each program does inside one timed iteration, because those differences
+are the mechanisms behind the disagreements in \cref{sec:spmvcg,sec:replay}.
+\Cref{tab:codepaths} summarizes them.
+
+\begin{table}[t]
+\centering
+\caption{What one timed iteration contains in each program, at the commits the campaign
+ran (irregular-benchmarking 2593e29, ABCG 29953fe). ``Exchange'' is one halo exchange of
+the SpMV's ghost values.}
+\label{tab:codepaths}
+\small
+\begin{tabular}{@{}>{\raggedright\arraybackslash}p{0.16\linewidth}>{\raggedright\arraybackslash}p{0.26\linewidth}>{\raggedright\arraybackslash}p{0.26\linewidth}>{\raggedright\arraybackslash}p{0.26\linewidth}@{}}
+\toprule
+& \pmrep{} (Cabana) & ABCG SpMV & ABCG CG \\
+\midrule
+Timer & \texttt{high\_resolution\_clock} (system clock) & \texttt{MPI\_Wtime} & \texttt{MPI\_Wtime}, end of one iteration to end of the next \\
+Exchanges & 1 & 1 & 1, plus 1 more every 8th iteration \\
+Pack & Cabana gather, Kokkos kernel into a send buffer & serial loop into a \texttt{std::vector<double>} & as ABCG SpMV \\
+Unpack & scatter into ghost slots & none & none; the off-process SpMV reads the receive buffer \\
+Overlap & none & none & on-process SpMV between start and wait \\
+Barrier & \texttt{MPI\_Barrier} after each exchange (\texttt{-b}) & \texttt{MPI\_Barrier} after each exchange & none \\
+Other & none & none & 2 allreduces, vector updates \\
+Persistent setup & first exchange, in the untimed startup window & \texttt{init()}, before the loop & as ABCG SpMV \\
+\bottomrule
+\end{tabular}
+% src: irregular-benchmarking 2593e29 src/benchmark.cpp (clock_type, runSample loop: apply, -b barrier) and scripts/gatherdata.sbatch (-x EXPORT -b -W); ABCG 29953fe benchmarks/benchmark_spmv.cpp (timed loop), benchmarks/benchmark_cg_pilot.cpp (timed_solve, recompute_r = 8), src/cg.cpp (spmv: pack, start, on_proc, wait, off_proc with get_recvbuf())
+\end{table}
+
+\paragraph{ABCG CG:} Each CG iteration packs the ghost values, starts the exchange,
+multiplies the on-process block of the matrix, waits for the exchange, and multiplies the
+off-process block directly from the receive buffer, so CG never copies received values.
+It then computes two inner products, each an allreduce, and updates three vectors. Every
+eighth iteration (iterations 0, 8, 16, \ldots, 63 of every 500) recomputes the residual
+with a second SpMV and therefore a second exchange, so a CG iteration contains 1.126
+exchanges on average. No barrier separates iterations, and each iteration is timed from
+the end of the previous one. CG is the only one of the three programs that overlaps
+communication with computation.
+% src: ABCG 29953fe benchmark_cg_pilot.cpp timed_solve; 63 = |{0,8,...,496}|
+
+\paragraph{ABCG SpMV exchange:} Each timed iteration packs the ghost values with a serial
+loop, starts and completes the exchange, and enters an \texttt{MPI\_Barrier}. There is no
+computation to overlap and no unpack. For STANDARD and LOCALITY, ABCG creates its persistent
+MPI Advance request, including the locality-aware communicator and its aggregation plan,
+before the timing loop, and passes the global column index of every ghost value.
+% src: ABCG 29953fe benchmark_spmv.cpp; src/comm/spmv_comm_mpil_pers.hpp (init: MPIL_Neighbor_alltoallv_init_ext_topo with global indices)
+
+\paragraph{\pmrep:} Each timed iteration calls Cabana's \texttt{gather.apply()} on a
+one-double-per-entry AoSoA and then the benchmark's \texttt{MPI\_Barrier}. The MPI arm uses
+Cabana's plain MPI halo and STANDARD and LOCALITY use Cabana's \texttt{LocalityAware}
+halo, which builds MPI Advance's persistent neighbor alltoallv on the first exchange.
+Because the benchmark times 25 startup exchanges apart from the $n$ timed ones, that setup
+falls outside $q$.
+% src: irregular-benchmarking 2593e29 src/benchmark.cpp runSample (window vs timed totals) and main (Cabana::Mpi vs Cabana::LocalityAware); run headers "-alltoallv: NEIGHBOR_ALLTOALLV_INIT_*"
+
+\section{Experimental Setup}
+\label{sec:setup}
+
+\paragraph{Machine and software:} We ran on Dane at LLNL, whose nodes have two Intel Xeon
+Platinum 8480+ sockets and two Omni-Path host fabric interfaces, with 112 MPI ranks per
+node, each bound to its own core, at 2, 4, 8, and 16 nodes (224 to 1,792 ranks), in the
+shared \texttt{pbatch} queue. We excluded nodes dane261 and dane764, which report 2 NUMA
+domains instead of 8 and crash LOCALITY. The software was Open MPI 4.1.2, gcc 13.3.1, MPI
+Advance \texttt{locality\_aware} commit 752a19b, irregular-benchmarking 2593e29, ABCG
+29953fe, and Vernier 09d650b.
+% src: report.tex sec. 3; compute-node facts from the 2026-10-15 write test (10-15-2026.txt: Omni-Path hfi1_0/hfi1_1, Xeon Platinum 8480+)
+
+\paragraph{Matrices:} We used six SuiteSparse matrices: crankseg\_2 (63,838 rows, 14.1M
+nonzeros), nd12k (36,000 rows, 14.2M), x104 (108,384 rows, 10.2M), crankseg\_1 (52,804
+rows, 10.6M), m\_t1 (97,578 rows, 9.8M), and nd24k (72,000 rows, 28.7M). We chose them
+for the structurally different halo exchanges their SpMV produces; each CG iteration
+repeats the same exchange, so convergence is not needed for timing.
+% src: report.tex sec. 3 (run file headers); rationale: 10-15-2026.txt sec. 6 item 9
+
+\paragraph{Procedure:} For each node count, a pilot job captured each matrix's SpMV halo
+with Vernier and then ran every kind on every matrix on STANDARD to choose an iteration
+count $n$ that takes about 10\,s; all three arms use that $n$. Each run warms up
+connections to ranks $r\pm1$ without timing, performs $k=25$ startup iterations, which $q$
+excludes, and then $n$ timed iterations. Forty launches per node count, each a separate
+Slurm allocation, ran every combination of 7 kinds, 6 matrices, and 3 arms, 126 runs per
+launch, each launch in its own random order with one \texttt{srun} per run. At most four
+launches of one node count ran at once, and up to 16 overall; the 160 launches ran over
+23.7 hours. Every run exited normally, every benchmark MPI Advance run verified its ghost
+values against plain MPI, and no ABCG SpMV run reported a wrong halo value.
+% src: report.tex sec. 3; audit.csv
+
+\paragraph{Comparisons:} The unit of replication is the launch, because runs within a
+launch share an allocation. A \emph{comparison} is a pair of arms, $A$ and $B$, of one kind
+on one matrix at one node count; its data are the 40 paired values
+$d = \ln(q_A/q_B)$, one per launch, and $d<0$ means $A$ was faster in that launch. There are
+504 comparisons (4 node counts, 7 kinds, 6 matrices, 3 arm pairs). We say a run
+\emph{stalled} if its time exceeds the fastest launch's of its configuration by at least
+one whole 0.160\,s step in a configuration where those steps are present
+(\cref{sec:distributions}), or if its $q$ exceeds five times its configuration's median.
+We classify each comparison by its \emph{stall regime}: \emph{none} if neither arm has a
+stalled run (321 comparisons), \emph{minority} if at most half of either arm's launches
+stalled (101), and \emph{majority} otherwise (82).
+% src: estimands.csv regime counts
+
+\section{How the Run Times Are Distributed}
+\label{sec:distributions}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.75\linewidth]{stall_quantum_excess_fine_crankseg_2_STANDARD_16nodes.png}
+\caption{Extra timed time of each of 40 launches of the fine replay of crankseg\_2 on
+STANDARD at 16 nodes ($n=57$ timed iterations), relative to the fastest launch, in units of
+0.160\,s. Every bar falls on a whole number.}
+\label{fig:stallhist}
+\end{figure}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.7\linewidth]{stall_steps_pm_crankseg_2_4nodes.png}
+\caption{Extra timed time of each launch of the \pmrep{} of crankseg\_2 at 4 nodes, per arm,
+in units of 0.160\,s ($n=440$ on every arm). MPI and STANDARD lose up to 432 stalls in 440
+iterations; LOCALITY loses none.}
+\label{fig:stallsteps}
+\end{figure}
+
+Shapiro-Wilk rejects normality at the 5\% level in 86\% of the 504 configurations of node
+count, kind, matrix, and arm on $q$, in 62\% on $\ln q$, and in 61\% of the 504 paired
+log ratios $d$. The median skewness is 1.24 on $q$ and 0.70 on $\ln q$. A diagnostic test
+alone says little at 40 observations per configuration, because Shapiro-Wilk detects
+departures too small to matter; the mechanism behind the departure is what decides which
+statistics fail.
+% src: normality.csv (cell q 0.859, cell ln q 0.621, comparison d 0.607; median skew 1.240, 0.695)
+
+The mechanism is a timing anomaly that the companion report identified: some MPI and
+STANDARD runs lose whole multiples of 0.160\,s inside the timed loop. In 61 of the 447
+configurations whose total timed time varies by at least 0.3\,s across launches, the
+launch-to-launch differences line up on a period with a median of 0.1600\,s and phase
+coherence up to 0.995 (\cref{fig:stallhist}). Among the replay and persistent ABCG kinds,
+266 of 9,600 MPI and STANDARD runs exceed five times their configuration's median, and no
+LOCALITY run does. Where stalls are common they are not outliers but most of the time. At
+4-node crankseg\_2, the \pmrep's MPI and STANDARD runs lose up to 432 stalls in 440
+iterations, and its LOCALITY runs none (\cref{fig:stallsteps}). Neither launch start time,
+any single node, nor the preceding run predicts which launches stall, and the cause is
+unknown~\cite{ladderreport}.
+% src: stall_quantum.csv (447 rows, 61 > 0.5, best period median 0.1600, max 0.9952); slow_runs.csv / runs.csv (266 of 9,600; 0 LOCALITY); stall_steps figure (pm 4n crankseg_2, max 432, n = 440)
+
+A stall distribution of this kind is a mixture: a narrow fast component, plus a component
+shifted by $k\times0.160$\,s whose weight differs between arms and launches. A mixture
+separates the estimands that different tests target. The median of $d$ describes the
+typical launch, the mean of $d$ (what a paired $t$-test on $\ln q$ targets) weights the
+stalled launches by their log time, and the ratio of mean times, $\ln(\bar q_A/\bar q_B)$,
+is the expected cost including stalls. These three agree in sign in 448 of the 504
+comparisons. Where they disagree, the estimates sit near zero, and in no comparison do the
+95\% intervals of the median and of the mean, or of the median and of the ratio of means,
+exclude zero on opposite sides (\cref{fig:estimands}). Removing whole stalls, however, changes the answer
+where most launches stall: in 23 of the 82 majority-regime comparisons the faster arm by
+median changes once each run's whole stalls beyond the fastest launch's are subtracted. At
+4-node crankseg\_2, the \pmrep's median STANDARD time is 16.6 times its LOCALITY time; with
+stalls removed it is 0.74 times. Because the fastest launch may itself contain stalls, this
+correction is a lower bound on the stall time.
+% src: estimands.csv (sign(median_lr) = sign(mean_lr) = sign(rom_lr) in 448; confident flips 0; clean_changes 23 of 82 majority; pm 4n crankseg_2 STANDARD/LOCALITY median 16.591, clean 0.741)
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.62\linewidth]{estimand_median_vs_rom.png}
+\caption{Median over 40 launches of $d=\ln(q_A/q_B)$ against the log ratio of the arms' mean
+times, for all 504 comparisons, colored by stall regime. Points in the upper-left and
+lower-right quadrants pick different arms; all of them lie near the origin.}
+\label{fig:estimands}
+\end{figure}
+
+\section{What Normal-Theory Statistics Get Right and Wrong}
+\label{sec:statistics}
+
+A test is reliable for this purpose if (1) it rejects a true null hypothesis no more often
+than its nominal level, (2) it detects a real difference of a size that matters, (3) its
+intervals contain the quantity they estimate at their nominal rate, and (4) its verdicts
+hold on a second set of allocations. We measured all four for two normal-theory tests, the
+paired $t$-test on $\ln q$ and on $q$, and two rank-based tests, the exact sign test on $d$
+and the Wilcoxon signed-rank test~\cite{wilcoxon1945individual}, whose estimand is the
+Hodges-Lehmann pseudo-median~\cite{hodges1963estimates}.
+
+\paragraph{Method:} To judge the tests without making any one of them the referee, we use
+each comparison's own 40 values as the population. For each test we shift the values so
+that the test's own estimand is exactly zero (the mean of $d$ for the $t$-test on $\ln q$,
+the mean of $q_A-q_B$ for the $t$-test on $q$, the median for the sign test, the
+pseudo-median for Wilcoxon), draw $n=5$, 10, 20, or 40 launches with replacement 2,000
+times, and count rejections at the 5\% level. Sampling with replacement from the
+comparison's values keeps the shape of its distribution, including its stalls, and avoids
+any overlap between the samples and the target. The Monte Carlo standard error of a 5\%
+rate is about 0.5 percentage points. Power uses the same shifted populations moved by
+$\ln 1.05$ or $\ln 1.10$. Coverage uses the unshifted populations. Replication uses the
+real launches split into two halves of 20.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.75\linewidth]{calibration_size_minority.png}
+\caption{False positive rate when each test's own null hypothesis is true, for the 101
+comparisons with stalls in under half the launches, by number of launches. Points are
+medians over comparisons and bars the 10th to 90th percentiles. The grey series is the
+$t$-test on $\ln q$ in populations where the typical launch is a tie.}
+\label{fig:size}
+\end{figure}
+
+\paragraph{False positives:} The paired $t$-test on $\ln q$ keeps close to its nominal
+level. Its median false positive rate over comparisons is 5.1 to 6.2\% at every number of
+launches and stall regime, and the share of comparisons above 7.5\% falls from 26 to 28\%
+at 5 launches to 1 to 8\% at 40. The $t$-test on raw $q$ does not. With stalls present its
+median rate is 10 to 14\% at 5 launches and 6 to 7\% at 40, and it exceeds 7.5\% in 63 to
+70\% of stalled comparisons at 5 launches and in 21 to 41\% at 40 (\cref{fig:size}). The
+sign test never exceeds its nominal level, because a binomial count is exact whatever the
+distribution, and Wilcoxon stays at 5.0 to 5.2\% from 10 launches on even though stalls
+make $d$ asymmetric.
+% src: calibration_size.csv (median by regime x n: t_ln 0.051-0.062; >7.5%: 0.26-0.28 at n=5, 0.01-0.08 at n=40; t_q majority/minority n=5 0.104/0.136, n=40 0.062/0.068; >7.5% 0.63/0.70 at n=5, 0.21/0.41 at n=40; sign <= 0.042; wilcoxon 0.050-0.052 for n >= 10)
+
+\paragraph{The estimand matters more than the distribution:} The grey series in
+\cref{fig:size} runs the $t$-test on $\ln q$ in populations where the median of $d$ is
+zero, so that the typical launch is a tie. At 40 launches the $t$-test then declares a
+winner in a median of 10 to 11\% of draws, and in more than 7.5\% of draws for 59 to 62\%
+of comparisons. This is not a false positive for the $t$-test, whose null concerns the
+mean; it is how often the $t$-test answers a different question from the one an engineer
+choosing an arm for a typical run is asking.
+% src: calibration_size.csv t_ln_vs_median n=40 median 0.098-0.110; >7.5% share 0.59-0.62
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.75\linewidth]{calibration_power_10pct.png}
+\caption{Probability of detecting a true 10\% difference, by number of launches, test, and
+stall regime (median over comparisons).}
+\label{fig:power}
+\end{figure}
+
+\paragraph{Power:} Without stalls, every test detects a 10\% difference with at least 0.92
+probability from 10 launches on, and the $t$-test is the only one that can reject at 5
+launches, where the smallest $p$-value of the sign and Wilcoxon tests is 0.0625. With
+stalls, no test detects a 10\% difference with more than 0.22 probability even at 40
+launches (\cref{fig:power}). Pooled over all comparisons, Wilcoxon and the sign test detect
+a 10\% difference with 0.89 and 0.80 probability at 20 launches against 0.72 for the
+$t$-test.
+% src: calibration_power.csv (10pct: none n=10 t 0.980, sign 0.919, wilcoxon 0.984; n=5 t 0.736; minority/majority n=40 <= 0.220; pooled n=20 wilcoxon 0.887, sign 0.801, t 0.722)
+
+\paragraph{Coverage:} The $t$ interval for the mean of $d$ covers 94.0 to 94.6\% in the
+median comparison, but 89 to 93\% in the worst tenth. The distribution-free interval for
+the median formed by order statistics covers at least its nominal level by construction
+(95.8 to 97.8\% for 10 to 40 launches), except at 5 launches, where no such interval can
+reach 95\%. The BCa bootstrap interval~\cite{efron1987better} for the median, which the
+companion report and our earlier analyses used, covers 93.0, 93.9, and 94.4\% at 10, 20,
+and 40 launches in the median comparison, slightly below nominal.
+% src: calibration_coverage.csv (t median 0.940-0.946, p10 0.893-0.930; order statistic 0.958-0.978 for n=10..40, 0.938 at n=5; BCa 0.930/0.939/0.944, 60 comparisons)
+
+\paragraph{Sample size:} We chose 40 launches with a normal-theory calculation of how many
+launches pin the mean of $\ln q$ to $\pm10\%$ at 95\%. The same calculation asks for more
+than 40 launches in 187 of the 504 configurations, and up to 1,111. At the number of
+launches it asks for, the $t$ interval covers less than 93\% in 172 configurations and as
+little as 77\% (\cref{fig:samplesize}). For the median, the distribution-free interval
+needs more launches than the normal-theory count in 215 of the 267 configurations where
+that count is at least 6, and more than 400 in 95 of them; part of that difference is the
+median's lower efficiency, not a failure of the calculation.
+% src: sample_size.csv (n_normal > 40: 24+82+81 = 187; max 1,111; t coverage < 0.93 in 172; min 0.77; n_median > n_normal in 215 of 267, > 400 in 95)
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.62\linewidth]{sample_size_normal_vs_median.png}
+\caption{Launches needed for a $\pm10\%$ interval, by a normal-theory calculation for the
+mean of $\ln q$ (horizontal) and for the distribution-free interval of the median
+(vertical), per configuration. Grey lines mark the campaign's 40 launches.}
+\label{fig:samplesize}
+\end{figure}
+
+\paragraph{Replication:} The four tests replicate their own significant verdicts on the
+other half of the launches equally well, 92.3 to 93.3\% of the time, and none reverses a
+verdict when the first 20 launches to start are compared with the last 20
+(\cref{fig:replication}); over 500 random splits, 0.03\% of significant verdicts reverse.
+With stalls in under half the launches, the sign test reaches significance less often than
+the $t$-test (35\% of half-samples against 45\%) and replicates less often (73 to 76\%
+against 85 to 89\%). Paired $d$ shows no trend with launch start time, position in the
+launch, or the number of concurrently running launches in any comparison (Spearman
+correlation, Benjamini-Hochberg~\cite{benjamini1995controlling} $q<0.05$), and a bootstrap
+over blocks of five consecutive launches gives intervals of the same width as the ordinary
+launch bootstrap (median ratio 1.01), so the launches behave as exchangeable for paired
+comparisons.
+% src: replication.csv summary (replication 0.9231-0.9333; chronological reversals 0; random 0.0003; minority sign sig_rate 0.3431-0.3515 vs t_ln 0.4455-0.4460; replication 0.7324-0.7583 vs 0.8538-0.8889); exchangeability.csv (0 of 504 at q < 0.05 for each covariate; block_over_iid median 1.01)
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.72\linewidth]{replication_chronological.png}
+\caption{For each test, the share of verdicts on 20 launches that are significant, and of
+those, the share the other 20 launches confirm or reverse, splitting the 40 launches into
+the first and last 20 to start.}
+\label{fig:replication}
+\end{figure}
+
+\paragraph{Verdicts on all 40 launches:} On the full data, the $t$-test on $\ln q$ and the
+sign test, each corrected for multiple comparisons within a kind, agree on 472 of the 504
+comparisons and never reach opposite verdicts. Of the 32 disagreements, 18 are in
+comparisons with stalls, where the $t$-test rejects alone in 14, and 14 are in comparisons
+without stalls, where the sign test rejects alone in 12. The two tests name a different
+best arm in 16 of the 168 configurations of kind, matrix, and node count. The $t$-test on
+raw $q$ disagrees with the sign test on 46 comparisons.
+% src: verdicts.csv crosstab (166+126+180 = 472); verdict_disagreements.csv (stalls: t only 14, sign only 4; power: sign only 12, t only 2); best_arm_tests.csv (16 of 168); t_q crosstab off-diagonal 46
+
+\section{Whether ABCG's SpMV Exchange Predicts CG}
+\label{sec:spmvcg}
+
+We say a stand-in \emph{reaches CG's verdict} on an arm pair at one matrix and node count
+if the sign test, run separately on each, gives the same outcome: $A$ faster, $B$ faster, or
+no decision. It \emph{reproduces CG's ratio} if the per-launch difference between the two
+kinds' log arm ratios has a 90\% order-statistic interval of its median inside $\pm10\%$,
+which is an equivalence test at the 5\% level.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.9\linewidth]{tracking_summary.png}
+\caption{For each stand-in and the run it is compared with, the share of the 72
+combinations of node count, matrix, and arm pair at which the stand-in reproduces the arm
+ratio within $\pm10\%$ (green), shifts it significantly (red), or reaches the same sign-test
+verdict (blue).}
+\label{fig:tracking}
+\end{figure}
+
+ABCG's SpMV exchange reaches CG's verdict on 62 of the 72 arm pairs (\cref{fig:tracking}).
+The companion report found that choosing CG's arm from the SpMV exchange's medians costs CG
+at most 4.2\%~\cite{ladderreport}. However, the SpMV exchange reproduces CG's ratio on only
+25 of 72 pairs, and only 7 of 24 for each pair involving LOCALITY, where the SpMV
+exchange's arm ratio is 0.58 to 1.41 times CG's. The exchange alone therefore orders the
+arms correctly but does not predict by how much one beats another.
+% src: tracking.csv stand_in=abcgspmv reference=abcgcg (verdict_agree 62; tracks 25; MPI/LOCALITY 7, STANDARD/LOCALITY 7; median_e range 0.578-1.406); report.tex tab:ladder
+
+Eight of the ten disagreements are between MPI and STANDARD at 2 and 4 nodes, on nd12k,
+x104, m\_t1, and nd24k. At four of them (2-node nd12k and x104, 4-node x104 and m\_t1) the
+two reach opposite significant verdicts: the SpMV exchange finds STANDARD faster and CG
+finds MPI faster, and the two kinds order MPI and STANDARD the same way in only 12.5 to
+42.5\% of launches. These are among the eight configurations where the companion report
+found every stand-in preferring STANDARD while CG is fastest on MPI, and none of them
+contains a stalled run.
+% src: tracking.csv abcgspmv vs abcgcg rows with verdict_agree False (8 MPI/STANDARD at 2-4 nodes; opposite at 2n nd12k, x104, 4n x104, m_t1; order_agree 0.125-0.425)
+
+The code paths in \cref{sec:codepaths} give two candidate mechanisms for this bias, which
+this campaign cannot separate. First, CG overlaps the exchange with the on-process SpMV.
+MPI's nonblocking sends and receives can progress during that multiply, whereas a
+neighbor alltoallv implemented as one collective may make no progress until its wait,
+so overlap can favor MPI in CG and not in the standalone exchange, which has nothing to
+overlap. Second, the SpMV exchange ends every iteration with a barrier and CG does not, so
+any difference in how the two arms leave ranks skewed is absorbed by the barrier in one and
+carried into the next iteration in the other.
+
+\section{Whether the Replay Benchmark Predicts ABCG}
+\label{sec:replay}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.9\linewidth]{tracking_pm_vs_abcgspmv.png}
+\caption{Ratio of the \pmrep's arm ratios to ABCG SpMV's, per node count, matrix, and arm
+pair: median over 40 launches with 90\% order-statistic intervals. The grey band is
+$\pm10\%$.}
+\label{fig:pmspmv}
+\end{figure}
+
+The \pmrep{} sends exactly ABCG's messages and bytes, so its disagreements with ABCG come
+from the code path. On LOCALITY it is 1.49 to 1.99 times slower than ABCG's SpMV exchange
+at every matrix and node count. On MPI and STANDARD it takes 0.95 to 1.14 times ABCG's time
+on m\_t1 and x104 at every node count, but 0.95 to 3.79 times on the crankseg matrices,
+nd12k, and nd24k, and more than 1.2 times at 23 of their 32 combinations of node count and
+arm; the largest ratios are at 8-node crankseg\_2 (3.2 on MPI and 3.8 on STANDARD), and
+most of the gap remains when slow runs are dropped. As a result it reproduces ABCG's ratio for
+neither arm pair involving LOCALITY at any of the 24 combinations, and shifts it
+significantly at 16 of 24 for each (\cref{fig:pmspmv}). It reaches the SpMV exchange's
+verdict on 53 of 72 arm pairs and CG's on 49. At 4-node nd12k and 16-node m\_t1 and x104
+it finds MPI or STANDARD significantly faster than LOCALITY where ABCG's exchange finds
+LOCALITY significantly faster; these are the configurations where the companion report
+found that the \pmrep's choice costs CG 1.6 to 21\%.
+% src: ratios.csv stand_in=pm reference=abcgspmv slow_runs=kept (LOCALITY 1.488-1.992; MPI/STANDARD m_t1, x104 0.95-1.14; other four matrices 0.950-3.786, > 1.2 at 23 of 32; 8n crankseg_2 3.19/3.79; slow_runs=dropped mostly unchanged, 16n crankseg_2 1.82/2.51 -> 1.35/1.48); tracking.csv pm vs abcgspmv (tracks 0 for LOCALITY pairs, shifted 16 each, verdict_agree 53); pm vs abcgcg verdict_agree 49; report.tex (4n nd12k 21%, 16n m_t1 7.1%, x104 1.6%)
+
+Because the MPI arm shares Cabana's pack, unpack, and barrier with the other arms, those
+costs cannot explain a gap that appears only on LOCALITY and is absent from MPI on the
+lighter matrices. The gap is therefore in how the benchmark's Cabana path drives MPI
+Advance's locality-aware exchange, rather than in Cabana or Kokkos as such.
+
+\section{Whether the Vernier Replays Predict the Matrix Replay}
+\label{sec:vernier}
+
+The fine replay reproduces the \pmrep's arm ratio on 38 of 72 arm pairs and shifts it
+significantly on only 2, and it reaches the same verdict on 64. Six of its eight
+disagreements are between MPI and STANDARD, and the other two are the LOCALITY pairs at
+2-node crankseg\_2, a configuration with stalls in under half the launches. The coarse replay reproduces the fine replay's ratio on 16 of 72 pairs and
+shifts it significantly on 49, and on the two LOCALITY pairs it reproduces the ratio at
+only 1 and 2 of 24 combinations, with ratios from 0.027 to 1.85 times. It reaches the fine
+replay's verdict on 52 of 72, and 14 of its 20 disagreements are at 2 and 4 nodes. These
+results are consistent with the companion report's finding that the job-wide histograms
+lose the partner structure that decides the aggregating arm at small node
+counts~\cite{ladderreport}.
+% src: tracking.csv fine vs pm (tracks 38, shifted 2, verdict_agree 64; 6 of 8 disagreements MPI/STANDARD, 2 at 2n crankseg_2); coarse vs fine (tracks 16, shifted 49, LOCALITY pairs tracks 1 and 2, median_e 0.027-1.845, verdict_agree 52, 14 of 20 at 2-4 nodes)
+
+\section{Discussion}
+\label{sec:discussion}
+
+The calibration and the stand-in comparisons lead us to the following conclusions about
+comparing halo-exchange strategies on a shared system like Dane.
+
+\paragraph{1) Test on log time, paired within an allocation:} The paired $t$-test on
+$\ln q$ held its false positive rate within about one point of nominal and replicated as
+well as the rank-based tests, even though Shapiro-Wilk rejected normality in most
+configurations. The $t$-test on raw time did not: with stalls it raised false positives to
+10 to 14\% at 5 launches. This recommendation holds for paired comparisons within an
+allocation; we did not test comparisons across allocations, such as across node counts,
+which do not cancel shared machine state.
+
+\paragraph{2) Choose the estimand before the test:} In stall-dominated configurations the
+mean, the median, and the expected cost answer different questions, and removing whole
+stalls changed the median's winner in 23 of 82 majority-regime comparisons. A test cannot
+make that choice. Where the question is the typical run, the sign test with an
+order-statistic interval answers it exactly; where the question is the expected cost of a
+long run, the ratio of means with a launch bootstrap does, stalls included.
+
+\paragraph{3) Do not trust normal-theory sample sizes on stall-prone patterns:} The
+calculation that chose 40 launches asks for hundreds on the MPI and STANDARD arms of the
+stall-prone matrices, and at its own recommended counts its intervals undercover in a
+third of configurations. With stalls present, no test detected a 10\% difference reliably
+at 40 launches, so the campaign can rank the arms in those configurations only where they
+differ by much more.
+
+\paragraph{4) Use the application's own exchange as the stand-in:} ABCG's SpMV exchange
+reached CG's verdict on 62 of 72 arm pairs and costs CG at most 4.2\% when it chooses.
+However, it does not reproduce CG's arm ratios within 10\% for most LOCALITY pairs, and it
+consistently prefers STANDARD where CG is fastest on MPI.
+
+\paragraph{5) A benchmark's code path can matter more than its pattern:} The \pmrep{} sends
+the exact pattern and still disagrees with ABCG wherever LOCALITY's advantage is small,
+because its locality-aware path is up to twice as slow. A replay benchmark is useful for
+choosing whether to aggregate only when the aggregating arm's advantage is larger than the
+difference between the benchmark's and the application's implementation of that arm.
+
+\section{Related Work}
+\label{sec:related}
+
+\paragraph{Statistics for performance measurement:} Hoefler and Belli's rules for
+reporting parallel performance include not assuming normality without diagnostic checking,
+and note that nonparametric metrics such as the median assume no particular
+distribution~\cite{hoefler2015scientific}. Hunold and Carpen-Amarie showed that MPI
+benchmark results vary between \texttt{mpirun} invocations and recommended treating the
+invocation as a factor, with 10 to 30
+invocations~\cite{hunold2016reproducible,hunold2015mpibenchmarking}. Georges et al.\ and
+Kalibera and Jones developed rigorous designs for managed-runtime
+benchmarks~\cite{georges2007statistically,kalibera2013rigorous}. Maricq et al.\ measured
+variability on testbed hardware and advise nonparametric confidence
+intervals~\cite{maricq2018taming}, Duplyakin et al.\ found performance regimes that evolve
+over time in years of cloud benchmark data~\cite{duplyakin2020datacenter}, and Agarwal et
+al.\ recommend bootstrap intervals when only a few runs are available~\cite{agarwal2021deep}.
+Our work is complementary to these: rather than recommending a method, it calibrates
+normal-theory and rank-based tests against the measured distribution of one HPC campaign,
+and finds that the paired $t$-test on log time survives a departure from normality that
+diagnostic tests flag in most configurations, while the $t$-test on raw time and
+normal-theory sample sizes do not.
+
+\paragraph{Variability on shared HPC systems:} Skinner and Kramer and Bhatele et al.\
+attributed run-time variability on HPC systems to contention from other jobs and system
+activity~\cite{skinner2005understanding,bhatele2013there}. The 0.160\,s stalls here are
+not predicted by the time, the nodes, or the preceding run, and we have not identified
+their source.
+
+\paragraph{Benchmarks as stand-ins:} Collom et al.\ compared locality-aware and standard
+neighbor collectives on SpMV and AMG patterns~\cite{collom2023}, and Vernier was designed to
+capture application patterns for replay at scale~\cite{vernier2025}. Unlike those studies,
+this work scores each stand-in against the run above it with paired tests and traces its
+disagreements to differences in executed code.
+
+\section{Conclusions and Future Work}
+\label{sec:conclusion}
+
+In this paper we evaluated, on 40 allocations at each of four node counts of Dane, which
+statistical tests give reliable verdicts on halo-exchange strategy comparisons, and how
+well each of five stand-ins reproduces the verdicts of the run above it. Normality was
+rejected in 86\% of configurations on run time, because MPI and STANDARD runs lose whole
+multiples of 0.160\,s. Nevertheless, the paired $t$-test on log time kept its false
+positive rate at 5.1 to 6.2\% in the median comparison and replicated its verdicts as well
+as the sign and Wilcoxon tests. However, the $t$-test on raw time reached 10 to 14\%
+false positives at 5 launches with stalls present, normal-theory sample sizes undercovered
+in a third of configurations, and no test detected a true 10\% difference reliably in
+configurations with stalls. ABCG's SpMV exchange reached CG's verdict on 62 of 72 arm pairs
+but reproduced CG's arm ratios within 10\% on only 25, and it preferred STANDARD where CG
+was fastest on MPI. The \pmrep{} reached CG's verdict on 49 of 72 arm pairs, because its
+locality-aware path was 1.49 to 1.99 times slower than ABCG's on the same messages.
+
+Several limitations of this study suggest future work. First, every run reports only
+totals over its iterations, so the stall mixture is inferred from launch-to-launch
+differences rather than seen in single iterations. Second, the campaign covers one machine,
+one MPI library, and allocations spanning one day. Third, we identified candidate
+mechanisms for the MPI versus STANDARD bias and for the replay's slower locality-aware path
+from the code but did not isolate them, which requires runs that remove one difference at
+a time, such as an unpack added to ABCG or a replay without Cabana.
+
+\bibliographystyle{plain}
+\bibliography{references}
+
+\end{document}

@@ -1,0 +1,508 @@
+\documentclass[11pt]{article}
+\usepackage[letterpaper,margin=1in]{geometry}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{array}
+\usepackage{xcolor}
+\usepackage{microtype}
+\setlength{\emergencystretch}{2em}
+\usepackage[hidelinks]{hyperref}
+\usepackage[capitalise,nameinlink]{cleveref}
+\usepackage{caption}
+\captionsetup{font=small,labelfont=bf}
+
+% Protocol facts cite the code that ran: irregular-benchmarking commit 2593e29
+% (src/, scripts/) and ABCG commit 29953fe (benchmarks/). Quotes were checked
+% verbatim against the papers' texts on 2026-10-14. Numbers about the data come from
+% data-10-14-2026/results/ (runs.csv, tables/) and the pilot output files.
+
+\newcommand{\verdict}[1]{\textbf{#1}}
+\newcommand{\pmrep}{\texttt{.pm} replay}
+
+\title{Assessing the Data-Collection Protocol of the Five-Way MPI\\Halo-Exchange Campaign Against Published Benchmarking Guidance}
+\author{Nicholas Bacon\\University of New Mexico}
+\date{October 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+MPI performance measurements vary between separate launches of the same program, so
+conclusions drawn from one launch, from unrandomized run orders, or from statistics that
+assume normality can be wrong without any visible error. Published guidance from HPC and
+from the broader systems and machine learning communities names these pitfalls and
+states how to avoid them. However, applying that guidance to a large campaign involves
+choices the guidance does not settle, such as the unit of replication and how to time an
+exchange closed by a barrier. In this document we assess the data-collection protocol of
+the October 2026 five-way halo-exchange campaign on LLNL's Dane, which ran 20,160 runs in
+160 separate Slurm allocations, against 28 requirements drawn from Hoefler and Belli,
+Hunold and Carpen-Amarie, related work, and the project's research plan. The protocol
+meets 10, partly meets 13, and does not meet 5. It replicates every combination in 40
+separate allocations per node count, randomizes run order within each allocation with a
+recorded seed, compares strategies with medians and intervals resampled over
+allocations, and keeps every outlier. It does not time single iterations, does not
+interleave strategies within a run, does not test whether ranks differ before
+summarizing them, fixed the number of allocations in advance instead of stopping on
+interval width, and does not state why its six matrices were chosen. It also chose
+iteration counts from pilot runs, some of them slowed by stalls, includes a barrier inside
+every timed interval of the replay and SpMV benchmarks, and spans 23.7 hours rather than
+weeks. We give
+the assessment as a reusable checklist and list changes for the next campaign.
+\end{abstract}
+
+\section{Introduction}
+
+The time an MPI program takes to communicate depends on factors the experimenter does
+not control. Hunold and Carpen-Amarie found that separate calls to \texttt{mpirun} within
+one job allocation produce means that ``are often not very large (3-5 percent), yet they
+are statistically significant'', and concluded that ``a call to mpirun is a factor of the
+experiment''~\cite{hunold2016reproducible}. Bhatele et al.\ attributed run-to-run
+variation of a communication-heavy application on a Cray XE6 mainly to ``contention for
+shared network resources from other jobs''~\cite{bhatele2013there}. Hoefler and Belli
+found that only two of the 95 papers in their survey reported confidence intervals
+around the mean, and they responded with twelve rules for measuring and reporting
+performance~\cite{hoefler2015scientific}.
+
+However, these rules leave choices to the experimenter, such as what to replicate, how
+to time an exchange that ends at a barrier, and how to summarize per-rank times, and
+those choices decide what the data can show. This document assesses the protocol of the
+five-way campaign, whose results are reported separately~\cite{fivewayreport}, against
+published guidance and against the project's research plan~\cite{researchplan}. For
+each requirement we quote the guidance, describe what the campaign did with a citation to
+the code that ran, and give a verdict of \emph{meets}, \emph{partly}, or \emph{does not}.
+This document makes the following contributions:
+\begin{itemize}
+\item A description of the campaign's measurement protocol taken from the code that ran
+  (\cref{sec:protocol});
+\item An assessment of that protocol against published requirements, grouped by topic,
+  with the consequence of each gap (\cref{sec:assessment});
+\item A reusable checklist of those requirements, filled in for this campaign
+  (\cref{sec:checklist});
+\item A list of changes for the next campaign, each tied to the gap it closes
+  (\cref{sec:changes}).
+\end{itemize}
+The assessment covers how the data was collected and summarized. Hoefler and Belli's
+rules on presenting results (Rules 1, 3, 11, and 12) concern the report and are outside
+its scope.
+
+\section{The Protocol as Run}
+\label{sec:protocol}
+
+\paragraph{Units and kinds:} A \emph{launch} is one Slurm allocation. A \emph{run} is one
+\texttt{srun} inside a launch, which starts a new MPI job for one combination of kind,
+matrix, and arm. An \emph{iteration} is one halo exchange, or one CG iteration for the
+CG kinds, inside a run. The campaign has seven kinds: three replays in the
+irregular-benchmarking benchmark (the \pmrep{} of the exact matrix halo, the fine replay
+of Vernier's per-rank capture, and the coarse replay of Vernier's aggregate histograms),
+ABCG's SpMV exchange and ABCG's CG iteration with persistent requests, and the same two
+ABCG kinds with one non-persistent call per exchange. The three arms are plain MPI
+point-to-point (MPI), MPI Advance's neighbor alltoallv (STANDARD), and MPI Advance's
+locality-aware neighbor alltoallv (LOCALITY). Each launch runs every combination of 7
+kinds, 6 matrices, and 3 arms once, 126 runs.
+
+\paragraph{Launches and order:} For each of 2, 4, 8, and 16 nodes, a pilot job and 40
+launches were submitted, with each launch waiting for the launch four places before it,
+so at most four launches of one node count ran at once (\path{scripts/submit.sh},
+lines 10--12 and 48--52). Up to 16 launches ran at once across node counts, and the 160
+launches spanned 23.7 hours. Each run is one \texttt{srun}
+(\path{scripts/gatherdata.sbatch}, lines 170 and 176), and each launch runs its 126
+runs in an order shuffled with a seed drawn from \texttt{/dev/urandom} and saved to the
+launch's folder (lines 126--138), so the order of any launch can be reproduced. Launches
+ran on the nodes Slurm assigned in the shared \texttt{pbatch} queue, with nodes dane261
+and dane764 excluded.
+
+\paragraph{Iteration counts:} The pilot ran each of the 42 patterns (kind and matrix) once
+on STANDARD with $n=100$ and chose the iteration count $n$ that makes the $k+n$ iterations
+total about 10\,s on STANDARD (\path{scripts/pilot.sbatch}, lines 148--160 for the
+replays and 165--181 for ABCG). Every arm then uses that $n$. Every run performs $k=25$
+iterations that are timed separately and excluded from the reported time per iteration.
+
+\paragraph{Timing in the replay benchmark:} Before any pattern is measured, each rank
+exchanges 64\,B and 128\,KiB messages with ranks $r\pm1$ on a duplicated communicator,
+untimed (\path{src/benchmark.cpp}, lines 123--158). A barrier precedes the first timed
+iteration (line 206). Each rank then times every iteration with
+\texttt{std::chrono::high\_resolution\_clock} (line 34), from just before the exchange
+until after a closing \texttt{MPI\_Barrier} (lines 213--219), and adds the elapsed time
+to per-rank totals for the first $k$ and the next $n$ iterations. It also keeps the same
+two totals stopped before the barrier, the time spent in the exchange alone (lines
+215--227). Rank 0 receives the minimum, maximum, and sum over ranks of each total (lines
+562--564) and prints the minimum, maximum, and mean; the analysis uses the maximum of the
+barrier-inclusive total. Individual iteration times are not kept. In GCC's C++ library,
+\texttt{high\_resolution\_clock} is an alias of \texttt{system\_clock}, a wall clock that
+is not guaranteed to be monotonic.
+
+\paragraph{Timing in ABCG:} ABCG's SpMV benchmark times each exchange barrier to barrier
+with \texttt{MPI\_Wtime} (\path{benchmarks/benchmark_spmv.cpp}, lines 51--68). ABCG's
+CG benchmark places one barrier before the first iteration and then records
+\texttt{MPI\_Wtime} at the end of each iteration, so each iteration is timed from the end
+of the previous one, with CG's own allreduces but no barrier in between
+(\path{benchmarks/benchmark_cg_pilot.cpp}, lines 34--42 and 139--140); the
+recomputation at the start of each new solve is charged to that solve's first iteration.
+Neither ABCG benchmark keeps a per-rank time stopped before a synchronization point.
+
+\paragraph{Correctness checks:} After timing, every replay run on STANDARD or LOCALITY
+performs one extra, untimed exchange through both MPI Advance and plain MPI on a freshly
+built halo and checks that every received value matches (\path{src/benchmark.cpp},
+lines 613--620); all 5,760 such runs report \texttt{verify: PASS}. ABCG's SpMV benchmark
+checks the buffer left by its last iteration against the expected columns
+(\path{benchmarks/benchmark_spmv.cpp}, lines 73--77). ABCG's CG benchmark compares its
+iteration count with ABCG's own solver, which is vacuous here: every completed solve
+reached the 500-iteration cap, and in 360 runs no solve completed within $k+n$
+iterations.
+
+\paragraph{Provenance:} Each launch records its node list, the CPU and memory binding of
+every rank, the MPI library, the Spack environment and its development checkouts, every
+input's hash, and selected environment variables (\path{scripts/provenance.sh}); the
+launch script saves the shuffle seed. Each replay run's output records its random seed,
+MPI library, and compiler. ABCG's binaries are recorded only by hash, with their
+compiler and flags stated in the campaign README. The replay benchmark's source is
+recorded as ``not a git checkout'', so its commit is a hand-entered string, and the Spack
+record's \texttt{locality\_aware} checkout (d10a789) is not the 752a19b the README says
+the benchmark binary was built against. The provenance does not record the interconnect
+(the fabric query on the compute nodes found no adapter it recognized), the processor
+frequency settings, or the clock source, and Slurm's topology plugin on Dane is
+\texttt{topology/flat}, so no switch placement is recorded.
+
+\paragraph{Analysis:} The analysis treats the launch as the unit of replication. It
+compares strategies by their medians over launches, with intervals from resampling whole
+launches (10,000 resamples). It flags runs whose time exceeds five times their
+combination's median, keeps them, and reports results with and without them. It
+estimates position-in-launch effects and the variance shared by a launch with linear
+mixed models.
+
+\section{Assessment}
+\label{sec:assessment}
+
+\subsection{Replication}
+
+Hunold and Carpen-Amarie found that ``it is insufficient for an MPI benchmark to collect
+MPI run-time measurements only from a single call to mpirun''; ``10 calls to mpirun
+seemed to be the minimum number of repetitions needed to obtain a good estimate of the
+variance between mpiruns, while 30 repetitions were sufficient in all cases'', which
+they offer as a rule of thumb~\cite[Section~4.2]{hunold2016reproducible}. Kalibera and
+Jones state that ``At the very least, repetition must be done at the highest level that
+has random variation to avoid bias''~\cite{kalibera2013rigorous}, and Georges et al.\
+compute confidence intervals ``across the computed means from the different VM
+invocations''~\cite{georges2007statistically}.
+
+Every combination ran once in each of 40 launches per node count, each time as its own
+\texttt{srun}, so each of its 40 measurements comes from a separate MPI job in a
+separate allocation. Hunold and Carpen-Amarie's own repetitions were separate
+\texttt{mpirun} calls inside one job (``All 30 calls to mpirun were executed as part of
+the same compute job''), so the campaign replicates at a higher level than their
+experiment and with more repetitions than their rule of thumb. The analysis computes one
+statistic per run and its intervals across launches, as Georges et al.\ do across
+invocations. Kalibera and Jones's highest level is the build, and the campaign used one
+build of each program, so it meets their rule for the levels it varies but does not
+replicate builds. \verdict{Meets for launches; partly for Kalibera and Jones's rule.}
+
+\subsection{Randomization and Interleaving}
+
+Hunold and Carpen-Amarie ``randomize the experiment by shuffling the order of
+experiments within a call to mpirun''~\cite[Section~5.1]{hunold2016reproducible}, and
+Hoefler and Belli write that ``If controlling a certain parameter is not possible then we
+suggest randomization following standard textbook
+procedures''~\cite{hoefler2015scientific}. Abedi and Brecht showed that single and
+consecutive trials can ``falsely report that the performance of two identical systems
+differ by 38\% using a confidence level of 95\%'', and that interleaving in a fixed order
+fails when conditions change periodically, so ``trials must be randomized to avoid such
+problems''~\cite{abedi2017conducting}. Their recommended design runs every alternative in
+a fresh random order in each round. Maricq et al.\ recommend randomizing order ``to expose
+effects that they might have on each other''~\cite{maricq2018taming}.
+
+Each launch runs all 126 combinations in a freshly shuffled order, so with launches as
+rounds the campaign follows Abedi and Brecht's design. The research plan asks for a
+second design as well, rotating strategies iteration by iteration within one run for
+claims about location~\cite{researchplan}. The campaign does not do this. Because every
+strategy of a combination already runs in the same allocation, whole-allocation shifts
+cancel in comparisons between strategies. However, the variation between runs within an
+allocation does not cancel, and it is most of the variance, since a shift shared by the
+whole launch accounts for only 9 to 23\% of the variance of log time~\cite{fivewayreport}.
+\verdict{Meets for randomized order by round; does not interleave within a run.}
+
+\subsection{Timing, Synchronization, and Per-Rank Summaries}
+
+Hoefler and Belli's Rule~10 reads ``For parallel time measurements, report all
+measurement, (optional) synchronization, and summarization techniques'';
+\cref{sec:protocol} does that. Their Section~4.2.1 and the research plan make further
+recommendations about how to time, which we take in turn.
+
+On synchronization, Hoefler and Belli write that a barrier ``may be unreliable because
+neither MPI nor OpenMP provides timing guarantees for their barrier calls. While a
+barrier commonly synchronizes processes enough, we recommend checking the
+implementation'', and they propose a window-based scheme. Hunold and Carpen-Amarie
+conclude that ``For a fair comparison of MPI implementations, relying on MPI\_Barrier may
+be completely sufficient if the same MPI\_Barrier algorithm is used by all of
+them''~\cite[Section~4.3]{hunold2016reproducible}. In the replay and SpMV benchmarks every
+arm's iterations close with the same Open MPI \texttt{MPI\_Barrier} on
+\texttt{MPI\_COMM\_WORLD}, which meets their condition, and the barrier prevents the
+``pipelining effects that occur when many operations are executed in a
+row''~\cite{hoefler2008accurately}. The same 2008 paper notes that a barrier may introduce process skew and may use the same
+network as the operation being measured, and the longer version of Hunold and Carpen-Amarie's study warns that
+``processes can become significantly skewed when they leave
+MPI\_Barrier''~\cite{hunold2015mpibenchmarking}. We did not measure barrier exit skew on
+Dane. ABCG's CG benchmark has no barrier between iterations; its iterations are
+separated only by CG's own allreduces.
+
+On where the timer stops, the research plan's first measurement rule is to time each
+rank ahead of every synchronization point, never around the iteration, because a timer
+around a synchronized iteration measures the slowest rank at every rank~\cite{researchplan}.
+The campaign's reported times include the closing barrier, so every rank's total includes
+its wait for the slowest rank. Over the replay runs, the time outside the exchange
+itself, which is the barrier wait plus any imbalance, is a median of 2 to 37\% of the
+timed total, depending on node count and arm. The replay benchmark does keep per-rank
+totals stopped before the barrier, but reports only their minimum, maximum, and mean;
+the ABCG benchmarks keep none.
+
+On summarizing across ranks, Hoefler and Belli write that a minimum or maximum across
+processes ``seems sufficient'' in some work and ``We recommend avoiding such non-robust
+measures'', proposing instead an ANOVA test of whether ranks' timings differ. The
+campaign reports the maximum without such a test. Its barrier-inclusive totals agree
+across ranks within 0.74\% in every run, but that agreement is produced by the barrier,
+so it does not show that ranks behave alike.
+
+On granularity, Hoefler and Belli write ``we recommend measuring single events to allow
+the computation of confidence intervals and exact ranks''. The campaign keeps only totals
+over $n$ iterations, so it has no per-iteration distribution and no within-run
+percentiles, and it cannot tell whether a slow run took one long iteration or many
+slightly slow ones. The 0.160\,s stalls reported for this campaign~\cite{fivewayreport}
+could therefore be identified only from the quantization of per-run totals.
+
+The replay benchmark's clock is \texttt{system\_clock}, which time synchronization can
+adjust during a run. A clock adjustment would affect every arm alike, but only 12 of the
+375 runs flagged as slow are LOCALITY runs, all of them non-persistent ABCG runs, so clock adjustments do not explain the
+stalls. A monotonic clock would still be the safer choice. \verdict{Partly.}
+
+\subsection{Warm-Up}
+
+Hoefler and Belli note that communication systems establish state on demand, ``Thus, to
+measure the expected time, the first measurement iteration should be excluded from the
+average computation''~\cite[Section~4.1.2]{hoefler2015scientific}. Hunold and
+Carpen-Amarie add that ``it is hard to estimate how many warm-up rounds are sufficient to
+reach a `steady state'\,''~\cite[Section~3.3]{hunold2016reproducible}. The campaign
+performs an untimed nearest-neighbor exchange before timing, excludes the first $k=25$
+iterations from the reported time, and reports their total separately. We did not test
+whether 25 iterations suffice for every combination. \verdict{Meets, with $k$
+untested.}
+
+\subsection{Number of Measurements and Run Length}
+
+Hoefler and Belli recommend recomputing the confidence interval as measurements
+accumulate and stopping once it is tight enough~\cite[Section~4.2.2]{hoefler2015scientific},
+and Maricq et al.\ give a procedure for choosing repetition counts from observed
+variability~\cite{maricq2018taming}. The campaign fixed 40 launches per node count in
+advance and did not check interval widths before stopping. Some achieved intervals are
+tight, such as the \pmrep's worst-case regret on CG, 19 to 26\%; others are not, such as
+the fine replay's, 0 to 133\%, and the coarse replay's, 1,738 to
+7,357\%~\cite{fivewayreport}. \verdict{Does not.}
+
+Within a run, Hunold and Carpen-Amarie found that ``a sample size of 30 is not large
+enough to obtain a normally distributed sample mean''~\cite[Section~4.1]{hunold2016reproducible},
+which bears on how many iterations a per-run mean needs. The pilot set $n$ so a run takes
+about 10\,s, but where the pilot itself stalled, $n$ came out small. At 16 nodes, the
+pilot's STANDARD run of the fine replay of crankseg\_2 measured 142.8\,ms per iteration
+and chose $n=57$. The fastest later MPI run of that pattern took 0.41\,ms per iteration,
+so its timed loop lasts about 23\,ms rather than 10\,s, and one 0.160\,s stall adds
+2.8\,ms to its time per iteration, about seven times the stall-free time; even the
+fastest STANDARD run of that pattern (3.2\,ms) contains one stall. Across the campaign,
+the pilot's time per iteration exceeded the fastest later STANDARD run's by more than 2
+times for 47 of the 168 combinations of node count and pattern, and by more than 10 times
+for 19 of them. \verdict{Partly.}
+
+\subsection{Statistics}
+
+Hoefler and Belli's Rule~5 asks for confidence intervals for nondeterministic data, Rule~6
+says ``Do not assume normality of collected data (e.g., based on the number of samples)
+without diagnostic checking'', and Rule~7 asks that comparisons be made ``in a
+statistically sound way''~\cite{hoefler2015scientific}. They also note that
+``Nonparametric metrics, such as the median or other percentiles, do not assume a specific
+distribution and are most robust'', and add that such measures still require independent
+and identically distributed measurements. Maricq et al.\ advise ``Use nonparametric
+confidence intervals to avoid assumptions of normality''~\cite{maricq2018taming}, and
+Agarwal et al.\ recommend bootstrap interval estimates when only a few runs are
+available~\cite{agarwal2021deep}.
+
+Every comparison between strategies uses medians over launches and intervals from
+resampling whole launches, with no assumed distribution, and ratios are compared with a
+bootstrap equivalence test at a $\pm10\%$ margin fixed before computing. However, the
+position-in-launch effect and the variance shares come from linear mixed models with
+normally distributed errors on log time, whose tails the stalls inflate, and we ran no
+normality diagnostic for them. Rule~4 reads ``Avoid summarizing ratios; summarize the
+costs or rates that the ratios base on instead. Only if these are not available use the
+geometric mean for summarizing ratios.'' The campaign's selection-gain statistic is a
+geometric mean of ratios across matrices, chosen because CG's times per iteration
+differ across matrices and arms by 11 to 147 times at a single node count; the costs
+were available, so this departs from Rule~4. Rule~8
+reads ``Carefully investigate if measures of central tendency such as mean or median are
+useful to report. Some problems, such as worst-case latency, may require other
+percentiles.'' The analysis reports the 10th percentile and robust spread over launches,
+the former as an exploratory check added after the stalls were found, but it has no
+within-run percentiles. \verdict{Partly.}
+
+\subsection{Outliers and Anomalies}
+
+Hoefler and Belli write ``We suggest to avoid removal of outliers and instead use robust
+measures such as percentiles'', and, where removal is necessary, ``one should report the
+number of removed outliers for each experiment''~\cite{hoefler2015scientific}. The
+analysis keeps every run, uses medians, flags runs over five times their combination's
+median, reports the number flagged (266 of 9,600 MPI and STANDARD runs of the five kinds
+the report studies), and shows each result with and without them. The five-times flag
+misses most stall-affected runs where stalls inflate the median itself, so results
+without flagged runs are only a partial check. \verdict{Meets.}
+
+\subsection{Interference, Stationarity, and Independence}
+
+Bhatele et al.\ found ``the primary reason for higher variability is contention for
+shared network resources from other jobs''~\cite{bhatele2013there}. Skinner and Kramer
+list contention for shared resources and system transitions among the causes of
+variability~\cite{skinner2005understanding}. Duplyakin et al.\ argue that measurements on
+clouds, HPC facilities, and datacenters are ``almost guaranteed to exhibit performance
+regimes that evolve over time'', and found such changes in 2.75 years of CloudLab
+benchmark data~\cite{duplyakin2020datacenter}. Kalibera and Jones warn that ``If
+measurements are not i.i.d., the variance and confidence interval estimates will be
+biased''~\cite{kalibera2013rigorous}.
+
+The campaign ran in a shared queue and treats interference from other jobs as part of the
+variation between launches. Neither launch start time (Spearman $|\rho| \le 0.12$,
+$p \ge 0.45$ at every node count) nor membership of any one node (smallest
+Bonferroni-corrected $p = 0.73$ over 124 nodes) showed an association with which launches
+stall, and the position effect within a launch is significant only at 8
+nodes~\cite{fivewayreport}, by the mixed model noted above. The campaign did not test
+whether its own concurrent launches, up to 16 at once, interfere with each other, and its
+23.7-hour span cannot show changes over weeks, for which the research plan asks for
+allocations spread across weeks~\cite{researchplan}. \verdict{Partly.}
+
+\subsection{Documentation and Provenance}
+
+Hoefler and Belli's Rule~9 reads ``Document all varying factors and their levels as well
+as the complete experimental setup (e.g., software, hardware, techniques) to facilitate
+reproducibility and provide interpretability'', and their Section~4.1.2 asks for network
+details. Hunold and Carpen-Amarie write that ``If an MPI benchmarking experiment does not
+clearly state the compiler and the compilation flags used, the results will not be
+comparable or might not even be trustworthy''~\cite[Section~4.5]{hunold2016reproducible},
+and they show that pinning and the processor frequency setting change MPI timings
+(Sections 4.4 and 4.6). Dodge et al.\ include a description of the computing
+infrastructure in their reporting checklist~\cite{dodge2019show}. Rule~2 asks
+experimenters to ``Specify the reason for only reporting subsets of standard benchmarks
+or applications or not using all system resources''.
+
+For the replay benchmark, the campaign records per launch the binary's hash, compiler,
+flags, and MPI library; for ABCG it records only binary hashes, with compiler and flags
+stated in the campaign README. The benchmark's commit is entered by hand, and the Spack
+record's \texttt{locality\_aware} checkout does not match the commit the binary was built
+against, so the provenance does not by itself identify the MPI Advance code that ran. The
+campaign records per-rank binding but not the interconnect, the processor frequency
+settings, or the clock source, and its documents do not state why these six SuiteSparse
+matrices were chosen. \verdict{Partly; does not for Rule~2.}
+
+\subsection{Correctness of What Is Measured}
+
+None of the papers above makes this a rule, but a strategy that delivers wrong data is
+not a valid point of comparison. The replay benchmark's check covers one untimed exchange
+per run after timing, against plain MPI, and all 5,760 checked runs passed. ABCG's SpMV
+check covers the last iteration's buffer. ABCG's CG check is vacuous, so no CG run has an
+effective correctness check. \verdict{Partly.}
+
+\section{Checklist}
+\label{sec:checklist}
+
+\Cref{tab:checklist} lists each requirement with its source, what this campaign did, and
+the verdict. A future campaign can keep the first two columns and fill in the last two.
+
+{\small
+\setlength{\tabcolsep}{4pt}
+\begin{longtable}{@{}>{\raggedright\arraybackslash}p{0.05\linewidth}>{\raggedright\arraybackslash}p{0.33\linewidth}>{\raggedright\arraybackslash}p{0.44\linewidth}>{\raggedright\arraybackslash}p{0.10\linewidth}@{}}
+\caption{Requirements and this campaign's protocol. H\&B: Hoefler and
+Belli~\cite{hoefler2015scientific}; H\&C: Hunold and
+Carpen-Amarie~\cite{hunold2016reproducible}; Plan: the project's research
+plan~\cite{researchplan}.}
+\label{tab:checklist}\\
+\toprule
+\# & Requirement (source) & This campaign & Verdict \\
+\midrule
+\endfirsthead
+\toprule
+\# & Requirement (source) & This campaign & Verdict \\
+\midrule
+\endhead
+1 & Repeat across separate \texttt{mpirun} calls, 10 to 30 as a rule of thumb (H\&C 4.2) & 40 launches per node count, each run its own \texttt{srun} & Meets \\
+2 & Repeat at the highest level with random variation (Kalibera and Jones) & Launches replicated; builds not replicated & Partly \\
+3 & Intervals across invocations, not iterations (Georges et al.) & One statistic per run, intervals across launches & Meets \\
+4 & Randomize order within a launch (H\&C 5.1; H\&B 4.1.1) & Order shuffled per launch with a saved seed & Meets \\
+5 & Randomized interleaving in rounds (Abedi and Brecht) & Each launch a round with a fresh random order & Meets \\
+6 & Interleave strategies per iteration for location claims (Plan 5.4) & Not done & Does not \\
+7 & Report timing, synchronization, and summarization (H\&B Rule~10) & Stated in \cref{sec:protocol} & Meets \\
+8 & Measure single events (H\&B 4.2.1) & Totals over $n$ iterations only & Does not \\
+9 & Time each rank ahead of synchronization (Plan 5.4) & Reported times include the barrier; pre-barrier totals kept only as min, max, and mean for the replays; none for ABCG & Partly \\
+10 & \texttt{MPI\_Barrier} suffices when every alternative uses the same barrier (H\&C 4.3) & Same barrier for every arm; exit skew not measured & Partly \\
+11 & Test whether ranks differ before summarizing (H\&B 4.2.1) & Maximum used without a test & Does not \\
+12 & Avoid pipelining between consecutive operations (Hoefler et al.\ 2008) & Barrier after every replay and SpMV iteration; CG iterations separated by its allreduces & Meets \\
+13 & Exclude warm-up (H\&B 4.1.2; H\&C 3.3) & Untimed warm-up plus 25 excluded iterations; adequacy untested & Meets \\
+14 & Stop when intervals are tight enough (H\&B 4.2.2; Maricq et al.) & 40 launches fixed in advance & Does not \\
+15 & Enough iterations per measurement (H\&C 4.1) & $n$ from pilots that ran more than 2 times slower than the fastest later run in 47 of 168 cases & Partly \\
+16 & Confidence intervals for nondeterministic data (H\&B Rule~5) & Bootstrap intervals over launches & Meets \\
+17 & No normality without checking (H\&B Rule~6; Maricq et al.) & Nonparametric for comparisons; normal mixed models unchecked & Partly \\
+18 & Statistically sound comparison (H\&B Rule~7) & Bootstrap intervals and equivalence test & Meets \\
+19 & Summarize costs, not ratios (H\&B Rule~4) & Selection gain is a geometric mean of ratios & Partly \\
+20 & Consider percentiles beyond the median (H\&B Rule~8) & 10th percentile and spread over launches; none within runs & Partly \\
+21 & Keep outliers; report how many are removed (H\&B 3.1.3) & All kept, flagged, shown with and without; flag is a partial check & Meets \\
+22 & Account for interference and nonstationarity (Bhatele et al.; Duplyakin et al.) & Shared queue; 23.7 hours; concurrent launches untested & Partly \\
+23 & Check independence (Kalibera and Jones; Maricq et al.) & Start time, node, and position tested & Partly \\
+24 & Document the complete setup (H\&B Rule~9) & Most recorded; interconnect, frequency, clock source missing; benchmark commit hand-entered & Partly \\
+25 & State compiler and flags (H\&C 4.5) & Per launch for the replays; README only for ABCG & Partly \\
+26 & Record pinning and frequency settings (H\&C 4.4, 4.6) & Binding recorded; frequency not & Partly \\
+27 & Justify subsets of benchmarks (H\&B Rule~2) & Reason for the six matrices not stated & Does not \\
+28 & Verify delivered data (not a published rule) & One untimed exchange per replay run; last SpMV buffer; CG vacuous & Partly \\
+\bottomrule
+\end{longtable}
+}
+
+Of the 28 requirements, the campaign meets 10, partly meets 13, and does not meet 5.
+
+\section{Changes for the Next Campaign}
+\label{sec:changes}
+
+There are several changes that address the gaps above, in order of how much they would
+change what the data can show. First, the benchmarks should record per-iteration,
+per-rank timestamps in memory, stopped before each synchronization point, and write them
+at the end of each run (items 8, 9, 11, and 20). This would show directly whether a stall
+is one 0.160\,s iteration and would allow a test of whether ranks differ. Second, claims
+about location should come from runs that interleave strategies iteration by iteration
+(item 6), with the whole-run design kept for spread between allocations. Third, the pilot
+should choose $n$ from a stall-robust estimate, such as the median of several pilot runs,
+with a floor on $n$ (item 15). Fourth, the campaign should check interval widths as
+launches accumulate and stop on a stated target (item 14). Fifth, launches should be
+spread over weeks and across at least one system change, and a controlled test should
+check whether concurrent launches of the campaign interfere (items 22 and 23). Sixth,
+provenance should come from git checkouts of every program, a Spack record that matches
+the builds used, the compiler and flags of every binary, and the interconnect, frequency
+setting, \texttt{MPI\_Wtick}, and clock source, and the benchmark should use
+\texttt{std::chrono::steady\_clock} (items 24 to 26). Seventh, the campaign documents
+should state why each matrix was chosen (item 27), the analysis should summarize costs
+rather than ratios where costs exist (item 19), and the mixed models should be checked
+against a normality diagnostic or replaced by a resampling method (item 17). Eighth, the
+CG benchmark should use a tolerance its solves can reach so its correctness check is not
+vacuous, and the replay check should cover a timed exchange (item 28). Finally, a short
+experiment should measure barrier exit skew on Dane (item 10).
+
+\section{Conclusion}
+
+In this document we assessed the five-way campaign's data-collection protocol against 28
+requirements drawn from Hoefler and Belli, Hunold and Carpen-Amarie, related HPC,
+systems, and machine learning work, and the project's research plan. The campaign
+replicated every combination in 40 separate allocations per node count, randomized run
+order within each allocation with recorded seeds, compared strategies with medians and
+intervals resampled over allocations, and kept and reported every outlier. It met 10
+requirements, partly met 13, and did not meet 5. It did not time single iterations, did
+not interleave strategies within a run, did not test whether ranks differ before taking
+their maximum, fixed its number of allocations in advance, and did not state why its six
+matrices were chosen. It also included a barrier inside every timed interval of the
+replay and SpMV benchmarks, chose iteration counts from pilots that ran more than 2 times
+slower than the fastest later run in 47 of 168 cases, spanned 23.7 hours rather than weeks, and left gaps in its provenance and
+correctness checks. The checklist in \cref{sec:checklist} can be refilled for the next
+campaign.
+
+\bibliographystyle{plain}
+\bibliography{references}
+
+\end{document}

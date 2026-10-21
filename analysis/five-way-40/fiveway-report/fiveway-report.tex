@@ -1,0 +1,2057 @@
+\documentclass[11pt]{article}
+\usepackage[letterpaper,margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{amsmath}
+\usepackage{float}
+\usepackage{placeins}
+\usepackage[hidelinks]{hyperref}
+\usepackage[capitalise,nameinlink]{cleveref}
+\usepackage{caption}
+\captionsetup{font=small,labelfont=bf}
+\graphicspath{{../results/figures_nocap/}}
+
+% Every number in this document was checked against the campaign's analysis tables on
+% 2026-10-15. Kind names are typeset with these macros so the text and the figure
+% titles (which print <m>, fine_, and coarse_) match.
+\newcommand{\kM}{\texttt{<m>}}
+\newcommand{\kF}{\texttt{fine\_}}
+\newcommand{\kC}{\texttt{coarse\_}}
+\newcommand{\spmv}{\texttt{abcgspmv}}
+\newcommand{\cg}{\texttt{abcgcg}}
+\newcommand{\spmvnp}{\texttt{abcgspmvnp}}
+\newcommand{\cgnp}{\texttt{abcgcgnp}}
+
+\title{Evaluating Whether Pattern Replay Ranks\\Halo-Exchange Strategies the Way ABCG Does:\\The Five-Way Campaign on Dane}
+\author{Nicholas Bacon\\University of New Mexico}
+\date{October 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+A framework that chooses a halo-exchange strategy once, at program launch, is useful only
+if a cheap measurement ranks the strategies the way the application itself would. We
+measured how well three stand-ins rank three halo-exchange strategies (plain MPI
+point-to-point, MPI Advance's neighbor alltoallv, and MPI Advance's locality-aware
+aggregating alltoallv) for the ABCG conjugate-gradient code. The stand-ins replay a
+matrix's sparse matrix-vector (SpMV) halo exchange from the matrix itself, from a
+per-rank Vernier capture, or from a job-wide Vernier histogram. We ran 40 separate
+allocations at each of 2, 4, 8, and 16 nodes of LLNL's Dane system on six sparse matrices,
+20,160 runs in all. The exact-matrix replay chooses a strategy that costs ABCG at most
+30\% at all 24 combinations of matrix and node count, and the per-rank replay does so at
+23 of 24; every choice that costs more than 5\% ranks the aggregating strategy too low. The
+job-wide histogram replay chooses differently from the per-rank replay at 4 of 12
+combinations at 2 and 4 nodes, where ABCG's exchange runs up to 24 times as long as on its
+best strategy, and agrees at every combination at 8 and 16 nodes. However, the largest
+effect in the data is not a pattern effect. Runs on the two non-aggregating strategies
+lose whole multiples of 0.160\,s inside the timed loop, and these stalls set many of the
+orderings above. We have not identified their cause.
+\end{abstract}
+
+\section{Introduction}
+\label{sec:intro}
+
+No single halo-exchange strategy is fastest for every sparse workload. Collom, Li, and
+Bienz showed that the faster of direct point-to-point exchange and locality-aware
+aggregation changes from level to level within one algebraic multigrid
+hierarchy~\cite{collom2023}. The research project this campaign belongs to proposes a
+decision framework that chooses a strategy once per program launch from a small set of
+cheaply measured features of the communication pattern, and judges that framework by its
+\emph{worst-case regret}, the largest slowdown its choice causes relative to the best
+available choice. Vernier records such features at scale~\cite{vernier2025}, and
+irregular-benchmarking, our group's replay benchmark, regenerates a halo exchange either
+from the matrix itself or from a Vernier capture and times it under each strategy.
+
+However, a Vernier capture is a lossy summary. Whether a replay built from it ranks the
+strategies the way the application does had not been measured, and neither had how much
+detail the capture must keep for the ranking to survive. This report measures both for
+the halo exchange of ABCG, a parallel conjugate-gradient (CG) code, on Dane. It also uses
+the same data to ask whether ABCG's best strategy changes across matrices and scales at
+all, how many iterations the aggregating strategy needs to repay its setup, and whether
+the fastest strategy is also the steadiest one. We call the experiment the
+\emph{five-way campaign} because it exchanges each matrix's halo five ways: three replays,
+ABCG's exchange alone, and ABCG's full CG iteration.
+
+This report makes the following contributions:
+\begin{itemize}
+\item The identification of a 0.160\,s stall quantum that dominates run-to-run variation on
+the non-aggregating strategies, and of its effect on every other result
+(\cref{sec:stalls});
+\item A measurement of how often three replay stand-ins choose ABCG's best strategy, and
+how much ABCG pays when they do not (\cref{sec:h17});
+\item A comparison of the per-rank and job-wide Vernier captures, with the pattern
+structure the job-wide capture loses (\cref{sec:h18});
+\item Measurements of whether ABCG's best strategy changes across matrices and node
+counts (\cref{sec:h0}), of paired time ratios between the stand-ins and ABCG
+(\cref{sec:ratios}), of median-best versus spread-best strategies (\cref{sec:h13}), of the
+break-even iteration count for aggregation (\cref{sec:h8}), and of order and
+between-allocation effects (\cref{sec:order}).
+\end{itemize}
+\Cref{sec:background} defines the strategies, the Vernier captures, the stand-ins, and the
+hypotheses under test. \Cref{sec:setup} describes the experiment and \cref{sec:methods}
+the metrics and statistics. Finally, \cref{sec:limits} states what this data cannot show
+and what we could not determine, and \cref{sec:conclusion} concludes.
+\Cref{app:tables} holds the per-combination tables behind the text, and \cref{app:figures}
+holds every figure produced by the analysis.
+
+\section{Background}
+\label{sec:background}
+
+The remainder of this section provides background on halo exchange and the three
+strategies we compare, on Vernier's two capture formats, on the stand-ins built from them,
+and on the hypotheses this campaign tests.
+
+\subsection{Halo exchange and the three strategies}
+
+In a distributed SpMV $y = Ax$, each MPI rank owns a contiguous block of rows of $A$ and
+the matching block of $x$. Before multiplying, each rank must receive the entries of $x$
+that its rows reference but other ranks own. This \emph{halo exchange} is an irregular
+neighbor exchange: each rank sends a different number of differently sized messages to a
+different set of partners, fixed by the matrix's sparsity pattern and the partition. CG
+performs one such exchange per iteration with the same pattern every time, so any setup a
+strategy performs once can be repaid over many iterations.
+
+We compare three strategies, which we call \emph{arms}:
+\begin{description}
+\item[MPI:] plain MPI nonblocking point-to-point sends and receives, posted and completed
+by the application, one message per partner.
+\item[STANDARD:] the MPI neighbor alltoallv collective as implemented by MPI
+Advance~\cite{mpiadvance2023}, a library of optimized MPI collectives. The application
+describes the whole exchange in one call on a communicator whose topology lists each
+rank's partners, and the library posts and completes the messages. It still sends one
+message per partner, without aggregation, so it differs from MPI in who issues the
+messages, not in what is sent.
+\item[LOCALITY:] MPI Advance's locality-aware neighbor alltoallv, which aggregates. Ranks
+are grouped into regions (here, NUMA domains; Dane nodes have 8). Data bound for the same
+remote region is first gathered within the sending region, sent as one message between
+regions, and then redistributed within the receiving region. This trades many small
+inter-region messages for fewer large ones plus intra-region copies, at the cost of a
+setup step that builds the aggregation plan. It is the only aggregating arm.
+\end{description}
+STANDARD and LOCALITY can be run \emph{persistently}, with the exchange set up once and
+reused through a persistent request, or \emph{non-persistently}, with one call per
+exchange that repeats the setup. The replay benchmark always uses the persistent form.
+ABCG has a persistent and a non-persistent kind (\cref{tab:kinds}); its MPI arm runs in
+both, and we have not confirmed whether ABCG's MPI arm itself uses persistent
+point-to-point requests.
+
+\subsection{Vernier and its two capture formats}
+
+Vernier is a communication-monitoring tool that records, at scale, statistics of an
+application's messages as histograms of message size and of logical neighbor distance (the
+difference between sender and receiver rank numbers), keyed by neighbor
+count~\cite{vernier2025}. Vernier stores these statistics through one of three
+\emph{data managers}, hierarchical, combined, and aggregate, which trade detail for
+scalability in that order. This campaign uses the hierarchical and the aggregate one.
+\begin{description}
+\item[Hierarchical:] one file per rank, holding for each partner the sizes that rank sent.
+Replaying it reproduces every rank's partners and message sizes exactly, but not which
+entries of $x$ each message carries.
+\item[Aggregate:] one set of histograms for the whole job, merged across ranks. It records
+how many neighbors ranks have, how far away (in rank number) those neighbors are, and how
+large the messages are, but not which rank has which neighbors or which ranks share a NUMA
+domain or node.
+\end{description}
+The aggregate format costs far less to collect and store at scale. The combined manager
+keeps less than the hierarchical one and more than the aggregate one; this campaign did not
+run it, and we do not describe it further. Below, the replay of a hierarchical capture is
+the \emph{fine} replay (\kF) and the replay of an aggregate capture is the \emph{coarse}
+replay (\kC); the abstract calls them the per-rank and job-wide replays.
+
+\subsection{The stand-ins and the application}
+
+A \emph{stand-in} is a cheaper measurement that exchanges a version of the same matrix's
+halo at the same node count; the \emph{application} is the code whose strategy we want to
+choose. ABCG is our project's standalone parallel CG solver; it reads a matrix, splits
+its rows into one contiguous block per rank, and runs CG with a selectable halo-exchange
+strategy. Each run belongs to one of seven \emph{kinds}, listed in \cref{tab:kinds} with
+the short names that appear in the figures. In run labels, \kM{} stands for the bare
+matrix name (a run of \kM{} on crankseg\_2 is labeled \texttt{crankseg\_2}), and the
+other kinds prefix the matrix name, as in \texttt{fine\_crankseg\_2}.
+
+\begin{table}[t]
+\centering
+\small
+\caption{The seven kinds of run. Each kind runs on each of the six matrices and three
+arms. ``Exchange-level'' kinds time only the halo exchange; \cg{} times full CG
+iterations.}
+\label{tab:kinds}
+\begin{tabular}{@{}lp{2.6cm}p{8.6cm}@{}}
+\toprule
+Name & Role & What one iteration does \\
+\midrule
+\kM & stand-in (matrix replay) & The replay benchmark reads the same matrix file as ABCG
+(a \texttt{.pm} file, the format both read), builds the exact SpMV halo, and exchanges it through the halo gather of the Cabana
+performance-portability library, followed by a barrier. No computation. \\
+\kF & stand-in (fine Vernier replay) & The replay benchmark reads the hierarchical capture;
+each rank sends its recorded sizes to its recorded partners, followed by a barrier. \\
+\kC & stand-in (coarse Vernier replay) & The replay benchmark reads the aggregate
+histograms; each rank draws a neighbor count, distinct partners by neighbor distance, and
+message sizes within histogram bins, followed by a barrier. It draws a new pattern every
+run. \\
+\spmv & application, exchange level & ABCG's own SpMV halo exchange (pack, exchange,
+barrier) with persistent requests; no multiply. \\
+\spmvnp & application, exchange level & The same with one non-persistent call per
+exchange. \\
+\cg & application, solver level & Full ABCG CG iterations with persistent requests: SpMV
+with its exchange, two allreduces, and vector updates, with no barrier. \\
+\cgnp & application, solver level & The same with one non-persistent call per exchange. \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Two facts about the stand-ins matter for reading the results. First, the round trip from
+the matrix to a hierarchical capture and back closes exactly. In every one of the 2,880
+paired runs, the minimum, maximum, and average over ranks of \kF's messages and bytes per
+exchange equal \kM's. Differences between \kF{} and \kM{} are therefore not reconstruction
+errors. Second, \kM{} reaches MPI Advance through Cabana's gather, while ABCG calls MPI
+Advance on its own buffers. On LOCALITY, this code path alone makes \kM{} 1.5 to 2.0
+times slower than \spmv{} (\cref{sec:ratios}), so a \kM-versus-ABCG comparison on LOCALITY
+compares code paths as well as patterns.
+
+The primary references are \spmv{} and \cg. The persistent ABCG kinds match the setting
+the framework targets, a pattern set up once and reused. We report \spmvnp{} and \cgnp{}
+only where they inform a result, because their LOCALITY time differs from the persistent
+one by up to 54 times (\cref{sec:ratios}), which makes them a different strategy rather
+than the same one run two ways.
+
+\subsection{Hypotheses under test}
+
+The project's research plan states its hypotheses before any data is collected and numbers
+them H0 to H23. This campaign bears on five of them, restated here in full; we keep the
+plan's numbers so that results can be matched to it, which is why they are not
+consecutive.
+\begin{description}
+\item[H17 (replay sufficiency):] a pattern reconstructed from a Vernier capture reproduces
+the application's ordering of arms at the configuration it was captured from. The plan
+predicted the shape of the failure in advance: ordering should hold between the
+non-aggregating arms (MPI and STANDARD) and degrade where the aggregating arm (LOCALITY) is
+involved, because aggregation's benefit depends on how ranks map to NUMA domains and nodes,
+and Vernier records that only as a histogram of logical neighbor distance.
+\item[H18 (capture fidelity is not the binding constraint):] the Vernier data manager needed
+to reproduce that ordering is the combined manager or a coarser one, so that the cheap
+capture suffices. As stated, H18 names the combined manager, which this campaign did not
+run. We test the nearest question the data allows, whether the aggregate capture (\kC)
+picks the same arm as the hierarchical one (\kF) and as the application.
+\item[H0 (the best arm changes):] across distinct workloads at a fixed machine, scale, and
+objective (here, median time per iteration), the fastest arm differs, and choosing the arm per workload beats the best single
+fixed arm by more than the uncertainty in that comparison. If H0 fails, one arm wins
+everywhere and there is nothing for the framework to choose.
+\item[H8 (amortization gate):] below a reuse count of order tens of iterations, no
+aggregating arm wins anywhere, because its setup cost has not been repaid; the location of
+that gate depends on the pattern. Collom et al.\ measured break-even points of 22 and 40
+iterations for two variants of locality-aware aggregation (22 for the more optimized one)
+at 2,048 cores on Lassen, a different machine~\cite{collom2023}.
+\item[H13 (two orderings):] the arm with the lowest median time and the arm with the lowest
+run-to-run spread differ somewhere.
+\end{description}
+A sixth, H15, concerns the distribution of per-iteration times. This campaign records only
+totals over many iterations, so it cannot test H15 (\cref{sec:limits}).
+
+\section{Experiment}
+\label{sec:setup}
+
+\paragraph{Machine and software:} We ran on Dane at LLNL, whose Intel Sapphire Rapids
+nodes have 112 cores and 8 NUMA domains each, with 112 MPI ranks per node, each bound to
+its own core, at 2, 4, 8, and 16 nodes (224, 448, 896, and 1,792 ranks), in the
+shared \texttt{pbatch} queue. We excluded nodes dane261 and dane764, which report 2 NUMA
+domains instead of 8 and crash LOCALITY. The software was Open MPI 4.1.2, gcc 13.3.1, MPI
+Advance's \texttt{locality\_aware} library at commit 752a19b, irregular-benchmarking 2593e29, ABCG
+29953fe, and Vernier 09d650b. Every MPI Advance run used NUMA domains as regions. The campaign's provenance records do
+not identify the interconnect or the transport Open MPI used.
+
+\paragraph{Matrices:} We used six symmetric matrices from the SuiteSparse collection:
+crankseg\_1 (52,804 rows, 10.6M nonzeros), crankseg\_2 (63,838 rows, 14.1M nonzeros),
+nd12k (36,000 rows, 14.2M nonzeros), nd24k (72,000 rows, 28.7M nonzeros), m\_t1 (97,578
+rows, 9.8M nonzeros), and x104 (108,384 rows, 10.2M nonzeros). Rows are split into one
+contiguous block per rank. \Cref{tab:matrices} gives the halo each produces. The crankseg
+and nd matrices give each rank 45 to 79 partners and send most bytes off-node at 4 nodes
+and above; m\_t1 and x104 give each rank 8 to 14 partners and send most bytes within the
+node. We call the first four \emph{communication-heavy} and m\_t1 and x104
+\emph{communication-light} below.
+
+\begin{table}[t]
+\centering
+\small
+\caption{Halo size per rank per exchange, measured from \kM's MPI-arm runs (median over
+launches): mean partners per rank (part.), mean KiB sent per rank, and the share of bytes
+sent to another node (off).}
+\label{tab:matrices}
+\setlength{\tabcolsep}{3.5pt}
+\begin{tabular}{@{}lrrrrrrrrrrrr@{}}
+\toprule
+& \multicolumn{3}{c}{2 nodes} & \multicolumn{3}{c}{4 nodes} & \multicolumn{3}{c}{8 nodes} & \multicolumn{3}{c}{16 nodes} \\
+\cmidrule(lr){2-4}\cmidrule(lr){5-7}\cmidrule(lr){8-10}\cmidrule(l){11-13}
+Matrix & part. & KiB & off & part. & KiB & off & part. & KiB & off & part. & KiB & off \\
+\midrule
+crankseg\_1 & 45.4 & 17.1 & 0.42 & 49.2 & 11.0 & 0.64 & 53.4 & 7.4 & 0.71 & 58.4 & 5.1 & 0.73 \\
+crankseg\_2 & 49.5 & 22.1 & 0.43 & 55.2 & 14.1 & 0.68 & 59.8 & 9.3 & 0.76 & 64.9 & 6.3 & 0.75 \\
+nd12k & 56.9 & 19.1 & 0.33 & 48.8 & 11.5 & 0.58 & 46.8 & 7.5 & 0.72 & 51.7 & 5.3 & 0.80 \\
+nd24k & 78.9 & 34.7 & 0.23 & 65.6 & 20.1 & 0.51 & 52.9 & 11.9 & 0.70 & 48.6 & 7.7 & 0.80 \\
+m\_t1 & 10.4 & 8.9 & 0.05 & 11.7 & 5.6 & 0.11 & 12.9 & 3.6 & 0.22 & 14.2 & 2.5 & 0.42 \\
+x104 & 8.2 & 13.1 & 0.02 & 11.7 & 7.7 & 0.05 & 13.2 & 4.6 & 0.11 & 13.6 & 2.8 & 0.19 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Pilot:} For each node count, a pilot job first captured each matrix's SpMV halo
+with Vernier (one exchange of ABCG's SpMV on the MPI arm, with both capture formats) at
+that node count. It then ran every one of the 42 kind-and-matrix \emph{patterns} on
+STANDARD to choose an iteration count $n$ that takes about 10\,s. All three arms, and all
+40 launches at that node count, use that $n$. A pattern that ran slowly in the pilot
+therefore gets a small $n$; this matters in \cref{sec:stalls}.
+
+\paragraph{Launches:} Forty \emph{launches} per node count, each a separate Slurm
+allocation, ran every combination of 7 kinds, 6 matrices, and 3 arms (126 runs per
+launch), each launch in its own random order with one \texttt{srun} per run. At most four
+launches of one node count ran at once. The 160 launches ran over 23.7 hours, from 15:00
+on 2026-10-13 to 14:43 on 2026-10-14 (US Pacific time), for 20,160 runs in all.
+
+\paragraph{One run:} Each run first exchanges once, untimed, with ranks $r\pm1$ to set up
+connections, then performs $k=25$ startup iterations, which absorb lazy setup and are
+excluded from the main timing, and then $n$ timed iterations. The replay benchmark closes
+every exchange with a barrier.
+
+\paragraph{Correctness checks:} The campaign defined these checks before it ran, and all
+held at every node count. All 160 launches completed; every run exited normally; every
+replay run on STANDARD or LOCALITY checked that every value it received matched what plain
+MPI delivers for the same exchange; no ABCG SpMV run reported a wrong halo value; and every \kF{} run sent
+exactly the same per-rank message counts and bytes as \kM. ABCG's CG reached its
+500-iteration cap without converging on all six matrices, so \cg{} times are
+fixed-iteration-count timings, not times to solution.
+
+\section{Metrics and Statistics}
+\label{sec:methods}
+
+\paragraph{Time per iteration:} For each run, $q$ is the run's total timed time, taken as
+the maximum over ranks, divided by $n$, in milliseconds. For the replay kinds and \spmv,
+one iteration is one exchange (\emph{exchange-level}); for \cg{} it is one CG iteration
+(\emph{solver-level}). We never report an exchange-level result as a solver-level one. Raw
+totals are never compared directly, because $n$ differs by pattern and node count. The
+maximum and minimum over ranks of a run's total differ by at most 0.74\% (median
+0.001\%), so the choice of maximum does not affect any result.
+
+\paragraph{Unit of replication:} The launch. Runs within a launch share an allocation and
+nodes and are paired, not independent. Every interval resamples whole launches (10,000
+resamples with a fixed seed, so all runs of a launch move together) unless stated
+otherwise. We call a (node count, matrix) pair a \emph{design point}; there are 24. A
+\emph{cell} is one node count, pattern, and arm, holding 40 runs.
+
+\paragraph{Decision regret:} For a stand-in $S$ and a reference application $R$ at one
+design point, $S$ chooses the arm with the lowest median $q$ over launches. The decision
+regret is $R$'s median time on that arm divided by $R$'s lowest median time over arms,
+minus 1. A regret of 0.30 means the application runs 30\% slower on the chosen arm than on
+its best arm; 0 means the choice was right. This is the launch-time setting the framework
+targets. Its interval is a percentile launch-bootstrap interval; the bootstrap also gives
+the probability that $S$'s choice changes. We report the same quantity for always using
+one fixed arm as a baseline.
+
+\paragraph{Per-launch regret and noise floor:} Per-launch regret makes the choice and scores
+it within each single launch; we report its median and maximum over the 40 launches. Its \emph{noise floor} is the
+same quantity when the application predicts itself: the arm chosen from one launch of the
+application is scored on another launch of the application, over all ordered pairs of
+launches. We report the median of that, and its expected maximum over 40 launches,
+computed as the mean over the 40 cyclic shifts of the launch order of the maximum over
+launches. A per-launch maximum no larger than the noise floor reflects launch noise rather
+than a stand-in error.
+
+\paragraph{Agreement:} Per launch, \emph{argmin agreement} asks whether the stand-in's
+fastest arm is the application's fastest arm. \emph{Pairwise agreement} asks, for each
+pair of arms, whether the stand-in orders the pair the same way as the application; when
+the application's two arms are within 10\% of each other (the \emph{tie band}), either
+order counts as agreement. Agreement rates carry 95\% Wilson score intervals, an interval
+for a proportion that stays inside $[0,1]$ at small counts.
+
+\paragraph{Paired ratios:} For two kinds on the same arm, we take the per-launch ratio of
+their $q$ and report the median over launches with a 95\% bias-corrected and accelerated
+(BCa) bootstrap interval, a percentile interval adjusted for skew. We call a ratio
+\emph{equivalent} to 1 when the two one-sided tests procedure (TOST) succeeds at a $\pm
+10\%$ margin, that is, when the 90\% BCa interval lies entirely within 0.9 to 1.1. We
+fixed the margin before computing any ratio.
+
+\paragraph{Spread:} The run-to-run spread of a cell is the median absolute deviation (MAD)
+of $\ln q$ over launches; a MAD of 0.1 is about 10\%. We repeat every spread result with
+the ratio of the 90th to the 10th percentile of $q$. This is spread between allocations
+about one day apart, not spread between iterations within a run.
+
+\paragraph{Slow runs:} A run is \emph{slow} when its $q$ exceeds 5 times the median of its
+cell. We fixed this rule before computing. We never drop slow runs silently. Every result
+is computed with slow runs kept, and repeated with them dropped where that changes
+anything.
+
+\paragraph{Not planned in advance:} Two analyses were added after we first examined the
+data, and we label them where used: the stall-quantum analysis (\cref{sec:stalls}) and the scoring of
+arms by their 10th-percentile launch instead of their median (\cref{sec:h18}).
+
+\section{Results}
+\label{sec:results}
+
+The subsections below are ordered by how much each finding changes what the data can be
+used for, starting with the one that affects all the others.
+
+\FloatBarrier
+\subsection{Most MPI and STANDARD variation is whole \texorpdfstring{0.160\,s}{0.160 s} stalls}
+\label{sec:stalls}
+
+\paragraph{What the stalls are:} In many cells, the differences between runs' total timed
+times are integer multiples of one constant. To detect this, for each cell whose total
+timed time spans at least 0.3\,s across launches (447 cells), we scanned candidate periods
+$Q$ from 0.08 to 0.30\,s and computed the \emph{phase coherence}, the magnitude of the mean
+of $e^{2\pi i\,\Delta T/Q}$ over all pairwise differences $\Delta T$ below 2\,s between
+the cell's runs. The coherence is 1 when every difference is a whole multiple of $Q$ and
+about 0.1 when the differences are unstructured. In 61 of the 447 cells the best coherence
+exceeds 0.5, and in those cells the best period has median 0.1600\,s (interquartile range
+0.1600 to 0.1605\,s), with coherence up to 0.995. Across all 447 cells the median best
+coherence is 0.145. Of the 61, 27 are MPI, 28 are STANDARD, and 6 are LOCALITY. In the
+cleanest cell, 16-node \kF{} crankseg\_2 on STANDARD with $n=57$, some launches took 56
+stalls longer than the fastest launch, nearly one 0.160\,s stall per timed iteration
+(\cref{fig:stall_quantum_excess_fine_crankseg_2_STANDARD_16nodes}).
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.75\textwidth]{stall_quantum_excess_fine_crankseg_2_STANDARD_16nodes.png}
+\caption{Extra timed time of each launch over the fastest launch, in units of 0.160\,s,
+for 16-node \kF{} crankseg\_2 on STANDARD (40 launches, $n=57$ timed iterations). The bars
+sit on whole numbers, so runs lose whole 0.160\,s stalls rather than running uniformly
+slower.}
+\label{fig:stall_quantum_excess_fine_crankseg_2_STANDARD_16nodes}
+\end{figure}
+
+\paragraph{Where they occur:} They hit MPI and STANDARD and spare LOCALITY. Of the 375 slow
+runs, 196 are MPI, 167 STANDARD, and 12 LOCALITY
+(\cref{fig:stall_quantum_coherence_by_cell}). By matrix, 210 are on crankseg\_2, 107 on
+crankseg\_1, 39 on nd24k, and 19 on nd12k, none on m\_t1 or x104. They come from the
+replay benchmark (76 \kM, 98 \kF) and from ABCG (199 across its four kinds) alike, and
+almost never from \kC{} (2). Slow runs occur in 6 of 40 launches at 2 nodes, 20 of 40 at
+4, 17 of 40 at 8, and 18 of 40 at 16. Seven runs took more than 15 minutes: six non-persistent
+\cg{} runs on crankseg\_1 at 8 nodes (39.7 to 77.3 minutes) and one \kF{} nd24k MPI run at
+16 nodes (24.4 minutes).
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.75\textwidth]{stall_quantum_coherence_by_cell.png}
+\caption{Phase coherence at a period of exactly 0.160\,s against the spread of total timed
+time across launches, one point per cell that spans at least 0.3\,s (447 cells, 40
+launches each). Color marks the arm. A coherence near 1 means run-to-run differences fall
+on whole multiples of 0.160\,s; about 0.1 means no structure. Points above the dashed line
+at 0.5 show the stall step clearly, and 54 of those 60 are MPI or STANDARD.}
+\label{fig:stall_quantum_coherence_by_cell}
+\end{figure}
+
+\paragraph{Why they matter:} The pilot sized $n$ on one STANDARD run, and on crankseg that
+run was itself stalled. At 16 nodes the pilot chose $n=55$ for \kM{} crankseg\_2, which
+implies about 180\,ms per iteration in the pilot, against a fastest campaign launch of
+3.3\,ms on the same arm. So $n$ is small exactly where stalls are common, and one stall
+adds $160/55 = 2.9$\,ms to that run's $q$. On 4-node crankseg\_2, the median MPI or
+STANDARD $q$ of \kM, \kF, and \spmv{} is 4 to 23 times its fastest launch's. The stalls are
+therefore not a few outliers. In those cells the median counts stalls, and the 5$\times$
+slow-run rule does not remove them, so every ``slow runs dropped'' result below is only a
+partial check. \Cref{sec:h18} gives the other view, scoring arms by their least-stalled
+launches.
+
+\paragraph{What does not predict a stall:} Not launch start time (Spearman rank correlation
+$|\rho| \le 0.12$, $p \ge 0.45$ at every node count;
+\cref{fig:launch_stall_score_vs_start}), not the kind of the run before it, and not
+individual nodes (124 nodes appeared in at least 3 launches; the smallest
+Bonferroni-corrected Mann--Whitney $p$ comparing launches with and without a node is 0.73).
+The cause is unknown. A fixed 160\,ms quantum points at a timer or a retransmission timeout
+in the transport layer, which the provenance does not identify. That is a hypothesis, and
+nothing in this data tests it.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.75\textwidth]{launch_stall_score_vs_start.png}
+\caption{Share of each launch's MPI and STANDARD runs that were slow, against the hours
+since the first launch started; one point per launch (160 launches), marker shape by node
+count. The legend gives the Spearman correlation per node count; none is significant, so
+the stall rate does not follow time of day over this one-day campaign.}
+\label{fig:launch_stall_score_vs_start}
+\end{figure}
+
+\FloatBarrier
+\subsection{H17: the matrix and fine replays pick a near-best arm; every costly miss is a missed LOCALITY win}
+\label{sec:h17}
+
+\Cref{tab:h17} summarizes decision regret over the 24 design points, with slow runs kept;
+\cref{tab:app:h17abcgspmv,tab:app:h17abcgcg} in \cref{app:tables} give every design point. For comparison, always
+using LOCALITY has a worst-case regret of 3.94 for \spmv{} and 2.05 for \cg, and always
+using MPI or STANDARD has a worst case of 65 to 85
+(\cref{fig:worst_case_regret}).
+
+\begin{table}[t]
+\centering
+\small
+\caption{Decision regret of each stand-in on each application over the 24 design points,
+40 launches each, slow runs kept. Worst case is the largest decision regret, with its 95\%
+launch-bootstrap interval and design point. The last column is the median over design
+points of the per-launch argmin agreement rate.}
+\label{tab:h17}
+\begin{tabular}{@{}llrr@{}}
+\toprule
+Stand-in $\rightarrow$ application & Worst case (95\% CI), where & Points $>5\%$ & Argmin agreement \\
+\midrule
+\kM{} $\rightarrow$ \spmv & 0.30 (0.27--0.33), 4 nodes nd12k & 3 of 24 & 0.875 \\
+\kM{} $\rightarrow$ \cg & 0.21 (0.19--0.26), 4 nodes nd12k & 2 of 24 & 0.70 \\
+\kF{} $\rightarrow$ \spmv & 1.09 (0.00--1.58), 2 nodes crankseg\_1 & 4 of 24 & 0.86 \\
+\kF{} $\rightarrow$ \cg & 1.01 (0.00--1.33), 2 nodes crankseg\_1 & 3 of 24 & 0.71 \\
+\kC{} $\rightarrow$ \spmv & 23.0 (16.4--95.9), 4 nodes crankseg\_2 & 8 of 24 & 0.64 \\
+\kC{} $\rightarrow$ \cg & 31.3 (17.4--73.6), 4 nodes crankseg\_2 & 7 of 24 & 0.35 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.8\textwidth]{worst_case_regret.png}
+\caption{Bars: the largest decision regret over the 24 design points for each stand-in
+choosing the arm for each application, as a percentage (100\% means the application runs
+twice as long as on its best arm). Markers: the same quantity for always using one fixed
+arm. 40 launches per design point; slow runs kept.}
+\label{fig:worst_case_regret}
+\end{figure}
+
+\paragraph{Every regret above 5\% has the same direction:} In all 27 cases, the stand-in
+picks STANDARD and the application's best arm is LOCALITY. This is the failure H17
+predicted, misjudging the aggregating arm.
+
+\paragraph{The fine replay's worst case is unstable:} At 2-node crankseg\_1, \kF's choice
+flips in 23\% of bootstrap resamples, and its interval reaches 0. The stable \kM{} miss at
+4-node nd12k (\cref{fig:regret_pm_vs_abcgspmv_4nodes}) comes from the Cabana code path:
+the replay's LOCALITY exchange is 1.5 to 2.0 times slower than ABCG's own
+(\cref{sec:ratios}), so the replay ranks LOCALITY below STANDARD where ABCG ranks it first.
+\kF{} misses the same way at the same point. \Cref{fig:regret_coarse_vs_abcgspmv_4nodes}
+shows the coarse replay's misses at the same node count.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.8\textwidth]{regret_pm_vs_abcgspmv_4nodes.png}
+\caption{Regret when \kM{} chooses the arm for \spmv{} at 4 nodes. Black: decision regret
+with its 95\% launch-bootstrap interval. Blue: per-launch regret (square, median over
+launches; open triangle, worst launch). Red: the noise floor, \spmv{} predicting itself
+from a different launch (line, median; open triangle, expected maximum over launches).
+40 launches per matrix; slow runs kept. The vertical axis is linear below 1\% and
+logarithmic above.}
+\label{fig:regret_pm_vs_abcgspmv_4nodes}
+\end{figure}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.8\textwidth]{regret_coarse_vs_abcgspmv_4nodes.png}
+\caption{Regret when \kC{} chooses the arm for \spmv{} at 4 nodes; encodings as in
+\cref{fig:regret_pm_vs_abcgspmv_4nodes}. 40 launches per matrix; slow runs kept.}
+\label{fig:regret_coarse_vs_abcgspmv_4nodes}
+\end{figure}
+
+\paragraph{Per-launch regret is mostly noise:} The noise floor's expected maximum over
+launches reaches 10.6 for \spmv. Single-launch regret maxima are therefore mostly launch
+noise from stalls, and the decision regret is the number to use.
+
+\paragraph{The predicted shape holds for the decision and fails pairwise:} H17 predicted that
+ordering holds for MPI versus STANDARD and degrades where LOCALITY is involved. The decision
+failures all involve LOCALITY, as predicted. Pairwise, however, MPI-versus-STANDARD
+agreement is the worst of the three pairs: pooled over design points, 0.76 to 0.79 with
+ties counted as agreement, against 0.91 to 0.93 for the two pairs involving LOCALITY, for
+\kM{} and \kF{} on both applications (\cref{fig:pairwise_agreement_pm_vs_abcgspmv}). Among
+launches where the application separates MPI and STANDARD by more than 10\%, agreement is
+0.48 to 0.53, no better than a coin flip. The bootstrap difference between MPI-versus-STANDARD
+agreement and the mean of the two LOCALITY pairs is significantly negative at 12 of 24
+design points for \kM{} and \kF, and significantly positive at 2 to 3. The likely reason is
+that, within one launch, whichever of MPI and STANDARD caught more stalls runs slower. That
+is a reading of \cref{sec:stalls}, not a test.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.9\textwidth]{pairwise_agreement_pm_vs_abcgspmv.png}
+\caption{Share of launches in which \kM{} orders each pair of arms the same way as \spmv,
+per design point, with 95\% Wilson intervals; when \spmv's two arms are within 10\%,
+either order counts as agreement. Grey marks the MPI-versus-STANDARD pair, which H17
+predicted would agree best. 40 launches per point; slow runs kept.}
+\label{fig:pairwise_agreement_pm_vs_abcgspmv}
+\end{figure}
+
+\paragraph{Dropping slow runs:} Every worst case stays at the same design point except \kM{}
+$\rightarrow$ \spmv, which moves to 2-node crankseg\_1 (0.88, interval 0.00 to 1.19). The
+coarse worst cases shrink to 15.2 (\spmv) and 18.5 (\cg).
+
+\FloatBarrier
+\subsection{H18: the aggregate capture is not enough at 2 and 4 nodes}
+\label{sec:h18}
+
+\paragraph{Coarse versus fine:} \kC{} and \kF{} choose the same arm at every 8- and 16-node
+design point (12 of 12). They choose differently at 4 of the 12 at 2 and 4 nodes: crankseg\_2
+at 2 nodes, and crankseg\_2, crankseg\_1, and nd24k at 4 nodes. \kF's regret on \kC's choice
+there is 0.72 (0.09--1.38), 17.2 (15.3--45.6), 6.0 (4.3--7.2), and 2.4 (1.8--3.2)
+(\cref{fig:regret_coarse_vs_fine_4nodes}). In every case \kC{} picks STANDARD and \kF's
+best is LOCALITY.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.8\textwidth]{regret_coarse_vs_fine_4nodes.png}
+\caption{Regret when \kC{} chooses the arm for \kF{} at 4 nodes; encodings as in
+\cref{fig:regret_pm_vs_abcgspmv_4nodes}, with \kF{} in the role of the application. 40
+launches per matrix; slow runs kept.}
+\label{fig:regret_coarse_vs_fine_4nodes}
+\end{figure}
+
+\paragraph{What the aggregate keeps:} \kC's mean bytes per rank are within 3.1\% of \kM's at
+every node count and matrix (0.993 to 1.031 times), and its mean messages per rank are
+within 1.1\%.
+
+\paragraph{What the aggregate drops:} Comparing \kC{} to \kM{} on the MPI arm (median over
+launches; \cref{fig:coarse_structure_ratio_4nodes}), at every node count on crankseg\_1,
+crankseg\_2, and nd24k, \kC{} sends 0.54 to 0.69 times as many bytes within a NUMA
+domain, 0.73 to 0.91 times as many within the node, and 1.05 to 1.83 times as many to
+other nodes. On every matrix, its busiest rank sends 1.17 to 2.06 times as many bytes as
+\kM's busiest rank. These follow from drawing partners by rank distance without regard to
+which ranks share a NUMA domain or node. However, they are just as large at 8 and 16
+nodes, where \kC{} chooses correctly, so they do not by themselves explain the 2- and 4-node disagreements. On nd12k the
+changes are smaller: 0.66 to 0.73 times as many bytes within a NUMA domain and 1.07 to 1.36
+times as many to other nodes.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.8\textwidth]{coarse_structure_ratio_4nodes.png}
+\caption{Per-rank pattern quantities of \kC{} divided by those of \kM{} at 4 nodes, from
+MPI-arm runs; 1 means preserved. Marker: median over 40 launches; bar: range over
+launches, since \kC{} draws a new pattern every run. \kF{} matches \kM{} exactly on all of
+these quantities.}
+\label{fig:coarse_structure_ratio_4nodes}
+\end{figure}
+
+\paragraph{The aggregate does not stall:} As \cref{sec:stalls} showed, \kC{} almost never
+stalls. The per-run standard deviation of its $\ln q$, defined in \cref{sec:order}, is
+about 5\% at 2 and 4 nodes, against 39 to 90\% for the other kinds.
+
+\paragraph{Scoring by the least-stalled launches (not stated in advance):} If stalls drive
+the misses, scoring each arm by its 10th-percentile launch instead of its median should
+remove them. Against the application, the 2-node crankseg misses of \kC{} and \kF{}
+vanish (regret 0.00 to 0.03); there, the application's best arm on its least-stalled
+launches is STANDARD (\spmv) or MPI (\cg), not LOCALITY. The 4-node misses of \kC{} shrink
+but remain: 9.5 (1.5--14.8) on crankseg\_2, 2.5 (2.4--3.3) on crankseg\_1, and 0.46
+(0.33--1.01) on nd24k, against \spmv.
+
+\paragraph{Reading:} At 2 nodes, the aggregate capture ``fails'' because the application's
+LOCALITY advantage there comes from avoiding stalls, which the aggregate pattern does not
+trigger. At 4 nodes something beyond the stalls remains. It is consistent with the
+dropped NUMA-local structure, but this data cannot separate the two. Note also that H18 as
+stated names the combined manager, which was not run, so H18 itself remains untested.
+
+\FloatBarrier
+\subsection{H0: the application's best arm changes across matrices and scales}
+\label{sec:h0}
+
+\paragraph{Best arm:} \Cref{tab:app:h0} gives the application's fastest arm at every
+design point, with bootstrap probabilities. For \spmv, by lowest median $q$,
+crankseg\_1 and crankseg\_2 are fastest on LOCALITY at every node count; nd12k and nd24k on
+STANDARD at 2 nodes and LOCALITY from 4 nodes; and m\_t1 and x104 on STANDARD through 8
+nodes and LOCALITY at 16 (\cref{fig:h0_best_arm_abcgspmv_2nodes,fig:h0_best_arm_abcgspmv_16nodes}).
+\cg{} is the same with MPI in place of STANDARD. The pattern is identical with slow runs
+dropped.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.75\textwidth]{h0_best_arm_abcgspmv_2nodes.png}
+\caption{For \spmv{} at 2 nodes, the share of 10,000 launch-bootstrap resamples in which
+each arm has the lowest median $q$, per matrix. A single color is a clear winner; mixed
+colors mean the data cannot separate the arms. 40 launches per matrix; slow runs kept.}
+\label{fig:h0_best_arm_abcgspmv_2nodes}
+\end{figure}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.75\textwidth]{h0_best_arm_abcgspmv_16nodes.png}
+\caption{As \cref{fig:h0_best_arm_abcgspmv_2nodes}, at 16 nodes, where LOCALITY wins every
+matrix.}
+\label{fig:h0_best_arm_abcgspmv_16nodes}
+\end{figure}
+
+\paragraph{Selection gain:} \Cref{tab:h0gain} compares choosing the best arm per matrix with
+using the single best fixed arm for all six matrices at a node count. To avoid scoring a
+choice on the data that made it, we \emph{cross-fit}: choose on a random half of the
+launches, score on the other half, and repeat over 2,000 random splits. Gain is the
+geometric mean over matrices of $q(\text{fixed})/q(\text{selected}) - 1$.
+
+\begin{table}[t]
+\centering
+\small
+\caption{Gain from choosing the arm per matrix over the best single fixed arm, by node
+count, with the median and 95\% range over 2,000 cross-fitted splits. Slow runs kept.}
+\label{tab:h0gain}
+\begin{tabular}{@{}rlll@{}}
+\toprule
+Nodes & \spmv{} gain (95\%) & \cg{} gain (95\%) & Best fixed arm \\
+\midrule
+2 & 0.29 (0.08--0.52) & 0.28 (0.08--0.46) & STANDARD (\spmv) or MPI (\cg) \\
+4 & 0.44 (0.435--0.446) & 0.29 (0.290--0.298) & LOCALITY \\
+8 & 0.15 (0.14--0.16) & 0.11 (0.10--0.12) & LOCALITY \\
+16 & 0.00 (0.00--0.00) & 0.00 ($-$0.01--0.00) & LOCALITY \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.75\textwidth]{h0_selection_gain_abcgspmv.png}
+\caption{Speedup of \spmv{} from choosing the arm per workload over the best single fixed
+arm. Left four points: the six matrices at one node count. Right six: the four node counts
+of one matrix. Points are medians and bars 95\% ranges over 2,000 cross-fitted splits.
+Slow runs kept.}
+\label{fig:h0_selection_gain_abcgspmv}
+\end{figure}
+
+\paragraph{Reading:} H0 is supported at 2 to 8 nodes and fails at 16, where LOCALITY wins all
+six matrices. At 2 nodes the gain rests on crankseg. By the 10th-percentile view of
+\cref{sec:h18}, crankseg's LOCALITY win at 2 nodes is mostly stall avoidance, so the 2-node
+H0 result is real for this machine as it behaved, but its mechanism is the stall rather
+than the pattern. Across the four node counts for one matrix, the gains for \spmv{} are
+smaller: 0.07 (0.067--0.079) for nd24k, 0.04 (0.035--0.046) for nd12k, 0.02
+(0.003--0.045) for m\_t1, 0.01 (0.000--0.024) for x104, and 0 for both crankseg matrices,
+which are fastest on LOCALITY at every node count (\cref{fig:h0_selection_gain_abcgspmv}). \spmv{} and \cg{} agree throughout.
+
+\FloatBarrier
+\subsection{Paired time ratios}
+\label{sec:ratios}
+
+\Cref{tab:ratios} gives, for each pair of kinds and each arm, the range over the 24 design
+points of the median per-launch ratio, and the number of design points at which the ratio
+is equivalent to 1 under TOST at $\pm10\%$.
+
+\begin{table}[t]
+\centering
+\small
+\caption{Range over the 24 design points of the median per-launch time ratio, and the
+number of design points (of 24) equivalent to 1 at $\pm10\%$. 40 launches per point; slow
+runs kept.}
+\label{tab:ratios}
+\begin{tabular}{@{}lrrrrrr@{}}
+\toprule
+& \multicolumn{2}{c}{MPI} & \multicolumn{2}{c}{STANDARD} & \multicolumn{2}{c}{LOCALITY} \\
+\cmidrule(lr){2-3}\cmidrule(lr){4-5}\cmidrule(l){6-7}
+Ratio & range & equiv. & range & equiv. & range & equiv. \\
+\midrule
+\kF{} / \kM & 0.925--1.061 & 15 & 0.861--1.415 & 15 & 0.993--1.008 & 24 \\
+\kC{} / \kM & 0.020--1.327 & 4 & 0.020--1.373 & 4 & 0.586--1.173 & 8 \\
+\kM{} / \spmv & 0.976--3.192 & 10 & 0.950--3.786 & 11 & 1.488--1.992 & 0 \\
+\spmv{} / \spmvnp & 0.727--1.117 & 14 & 0.808--1.106 & 13 & 0.019--3.246 & 1 \\
+\cg{} / \cgnp & 0.784--1.104 & 14 & 0.895--1.144 & 15 & 0.024--2.269 & 1 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Fine versus matrix replay:} Equivalent on LOCALITY at all 24 points. On MPI and
+STANDARD, 15 of 24 are equivalent and the rest differ by stall noise, up to 1.42 times
+(\cref{fig:ratio_fine_vs_pm_4nodes}). With the round trip exact, the fine replay
+reproduces the matrix replay wherever stalls do not intervene.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.8\textwidth]{ratio_fine_vs_pm_4nodes.png}
+\caption{Per-launch ratio of \kF's $q$ to \kM's on the same arm at 4 nodes; points are
+medians over 40 launches with 95\% BCa intervals, one color per arm. The grey band is the
+$\pm10\%$ equivalence margin. Slow runs kept.}
+\label{fig:ratio_fine_vs_pm_4nodes}
+\end{figure}
+
+\paragraph{Matrix replay versus ABCG on LOCALITY:} 1.49 to 1.99 times, never equivalent
+(\cref{fig:ratio_pm_vs_abcgspmv_4nodes}). Both send identical messages, so this is the
+Cabana code path, and any \kM-versus-ABCG LOCALITY comparison carries it.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.8\textwidth]{ratio_pm_vs_abcgspmv_4nodes.png}
+\caption{Per-launch ratio of \kM's $q$ to \spmv's on the same arm at 4 nodes; encodings as
+in \cref{fig:ratio_fine_vs_pm_4nodes}.}
+\label{fig:ratio_pm_vs_abcgspmv_4nodes}
+\end{figure}
+
+\paragraph{Persistent versus non-persistent ABCG on LOCALITY:} 0.019 to 3.2 times for the
+exchange and 0.024 to 2.3 times for CG, equivalent at 1 of 24 points each. On the communication-heavy matrices the
+non-persistent form, which rebuilds LOCALITY's aggregation plan on every call, is the slower
+one, by up to 54 times. On m\_t1 and x104 at 2 and 4 nodes the reverse holds: persistent
+LOCALITY is 1.5 to 3.2 times slower than non-persistent. We have not explained that
+reversal. Either way, the two are different regimes, not one arm run two ways. On MPI and STANDARD, 13 to 15 of 24 are
+equivalent.
+
+\paragraph{Coarse versus matrix replay:} 0.020 to 1.37 times on MPI and STANDARD (4 of 24
+equivalent each), where the low end is \kC{} not stalling, and 0.59 to 1.17 times on
+LOCALITY (8 of 24).
+
+\FloatBarrier
+\subsection{H13: where the fastest arm is not the steadiest, LOCALITY is the steadiest}
+\label{sec:h13}
+
+In 36 of 168 cells of (kind, node count, matrix), the arm with the lowest median $q$ and
+the arm with the lowest spread differ, each with bootstrap probability at least 0.9 of
+being best. With the 90th-to-10th percentile ratio as the spread measure, the count is
+41, and with slow runs dropped it is unchanged. \Cref{tab:app:h13} lists all 36.
+
+\paragraph{Every one of the 36 has the same form:} STANDARD or MPI has the lowest median,
+and LOCALITY has the lowest spread. Twenty-four of the 36 are on m\_t1 and x104, 10 on nd12k and nd24k, and 2, both
+\kC's at 4 nodes, on crankseg; 30 are at 2 to 8 nodes. They include the application: for \spmv, 2-node nd12k, x104, and m\_t1, and
+4-node x104; for \cg, 2-node x104 and nd24k, and 4-node x104 and m\_t1. In the 2-node \spmv{}
+cells, LOCALITY's MAD of $\ln q$ is 0.009 to 0.020, against 0.025 to 0.047 for MPI and
+STANDARD (\cref{fig:h13_median_vs_spread_abcgspmv_2nodes}).
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.8\textwidth]{h13_median_vs_spread_abcgspmv_2nodes.png}
+\caption{Median $q$ against run-to-run spread (MAD of $\ln q$ over launches) for \spmv{} at
+2 nodes, one marker per arm (color) and matrix (shape), with 95\% launch-bootstrap
+intervals. Where a matrix's left-most and lowest markers differ in color, the fastest arm
+is not the steadiest. 40 launches per matrix; slow runs kept.}
+\label{fig:h13_median_vs_spread_abcgspmv_2nodes}
+\end{figure}
+
+\paragraph{Reading:} This supports H13 on this machine. LOCALITY's lower spread appears mostly on
+m\_t1 and x104, which have the fewest partners per rank, and also on nd12k and nd24k. The spread is between allocations about one day apart, not per iteration or per solve, which
+this data does not have.
+
+\FloatBarrier
+\subsection{H8: LOCALITY's break-even iteration count}
+\label{sec:h8}
+
+We model the cost of $N$ iterations on an arm as $\text{setup} + qN$, where setup is
+ABCG's measured setup time, or the replay benchmark's halo and gather-plan construction
+time, plus the startup iterations' excess over $kq$. LOCALITY has the larger setup and,
+where it wins, the smaller $q$. The break-even count $N^*$ is the $N$ at which the two
+costs are equal, computed from medians over launches with a 95\% launch-bootstrap
+interval. ``Never'' means LOCALITY's $q$ is not smaller, so it never catches up;
+``always'' means LOCALITY wins from the first iteration; ``until'' means LOCALITY wins only
+below $N^*$. The untimed connection warmup is outside the model, so these $N^*$ are lower
+bounds on a cold start. \Cref{tab:h8} gives $N^*$ for \spmv{} against MPI;
+\cref{app:tables} gives the other kinds and STANDARD.
+
+\begin{table}[t]
+\centering
+\small
+\caption{Break-even iteration count $N^*$ for LOCALITY against MPI on \spmv, median with
+95\% launch-bootstrap interval, 40 launches per point; slow runs kept.}
+\label{tab:h8}
+\footnotesize
+\setlength{\tabcolsep}{3.5pt}
+\begin{tabular}{@{}rllllll@{}}
+\toprule
+Nodes & crankseg\_1 & crankseg\_2 & nd12k & nd24k & m\_t1 & x104 \\
+\midrule
+2 & 161 (86--908) & 95 (58--246) & never & never & never & never \\
+4 & 40 (24--54) & 23 (13--33) & 1,178 (1,032--1,257) & 185 (126--259) & never & never \\
+8 & 21 (4--37) & 35 (10--42) & 130 (93--159) & 93 (73--116) & never & never \\
+16 & 22 (10--31) & 9 (3--15) & 570 (433--643) & 68 (38--89) & 4,340 (2,858--5,821) & 4,625 (2,930--7,915) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.8\textwidth]{h8_nstar_abcgspmv_LOCALITY_vs_MPI.png}
+\caption{$N^*$ for LOCALITY against MPI on \spmv, per matrix and node count (marker), with
+95\% launch-bootstrap intervals. Red markers at the top: LOCALITY never wins. Dotted
+lines: the 22 and 40 iterations of Collom et al.~\cite{collom2023}. 40 launches per point;
+slow runs kept.}
+\label{fig:h8_nstar_abcgspmv_LOCALITY_vs_MPI}
+\end{figure}
+
+\paragraph{Reading:} On persistent ABCG, the crankseg break-even against MPI at 4 to 16
+nodes, 9 to 40 iterations (12 to 46 against STANDARD), is the same order as Collom et al.'s 22 and 40, measured at 2,048 cores on
+Lassen. \cg{} is similar and lower, 7 to 31 on crankseg at 4 to
+16 nodes. On nd24k and nd12k it is tens to about a thousand iterations (68 to 1,178 for
+\spmv{} at 4 to 16 nodes), and on the communication-light m\_t1 and x104 it is thousands or
+never. This fits H8's form, in which the gate moves with the pattern. For the
+non-persistent kinds, which repeat LOCALITY's setup on every call, the outcome is ``never''
+or ``until'' at 14 of 24 points for the exchange and 15 of 24 for CG, against MPI. We exclude \kF{} and
+\kC{}, whose setup time includes reading the Vernier files (cell medians of 12 to 958\,ms, and
+221 to 958\,ms on the communication-heavy matrices).
+
+\FloatBarrier
+\subsection{Order effects and variance}
+\label{sec:order}
+
+\paragraph{Position in the launch:} We fit a linear mixed model of $\ln q$ with a fixed
+effect per cell, the run's position in its launch's random order, and the kind of the
+preceding run, with a random intercept per launch. The position coefficient, as change in
+$\ln q$ per 100 positions with its 95\% interval, is +0.018 ($-$0.010 to 0.045) at 2
+nodes, $-$0.024 ($-$0.064 to 0.017) at 4, +0.070 (0.025 to 0.116) at 8, and +0.001
+($-$0.035 to 0.037) at 16 (\cref{fig:position_effect_by_nodes}). Only 8 nodes drifts,
+about 9\% from the first run of a launch to the last, and +0.065 (0.029 to 0.101) with
+slow runs dropped. We have not determined why. The preceding run's kind has no consistent
+effect on the stall rate.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.7\textwidth]{position_effect_by_nodes.png}
+\caption{Estimated change in $\ln q$ per 100 positions later in a launch's run order (0.1
+is about 10\% slower), from the mixed model in the text, with 95\% intervals. Black: all
+runs; red: slow runs dropped. 40 launches per node count.}
+\label{fig:position_effect_by_nodes}
+\end{figure}
+
+\paragraph{Variance between and within launches:} We fit $\ln q$ with a fixed effect per
+cell and a random intercept per launch, per node count. The \emph{intraclass correlation}
+(ICC), the share of the remaining variance that is a shift shared by every run in a launch,
+is 0.09 to 0.23 overall and 0.06 to 0.36 by kind (\cref{fig:variance_share_4nodes}). Most
+variance is per run, which this design cannot split into repeat noise and launch-by-cell
+interaction, because each cell runs once per launch. Expressed as a percentage, the
+per-run (residual) standard deviation of $\ln q$ in this model is about 5\% for \kC{} at 2
+and 4 nodes, against 39 to 90\% for the other kinds.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.75\textwidth]{variance_share_4nodes.png}
+\caption{Variance of $\ln q$ after removing each cell's mean, at 4 nodes, split into a
+shift shared by every run in a launch (blue) and each run's own deviation (orange), for all
+kinds together and per kind. In each pair, the left bar keeps all runs and the faded right
+bar drops slow runs. 40 launches.}
+\label{fig:variance_share_4nodes}
+\end{figure}
+
+\FloatBarrier
+\section{Limitations and Open Questions}
+\label{sec:limits}
+
+\paragraph{What this data cannot show:} Each run reports only totals over $n$ iterations, so
+there are no per-iteration times: no tail percentiles within a run, no fits of extreme-value
+distributions to per-iteration maxima (which H15 requires), and no per-iteration
+dispersion. All spread is across ranks or across launches. The replay kinds are
+barrier-closed and do no computation, so no claim about accumulation of delay across
+iterations or about overlap of communication and computation comes from \kM, \kF, or
+\kC; only \cg{} is solver-level. The campaign covers one machine and software stack (Dane,
+Open MPI 4.1.2, MPI Advance 752a19b) in a shared queue, and its launches span about one
+day rather than weeks, so it likely underestimates spread between allocations. It runs
+only three of the strategies the full study plans to compare, with no one-sided (RMA)
+strategy, and does not test the combined Vernier manager. Finally, arms run as whole runs in random order rather than
+interleaved iteration by iteration, so the design measures dispersion across allocations,
+not small differences in location within one.
+
+\paragraph{What we could not determine:} We do not know what causes the 0.160\,s stalls, or
+why the aggregate pattern avoids them. The next test is inexpensive: run \kM{} and \kC{}
+crankseg\_2 on MPI at 4 nodes with per-iteration timing and check whether single iterations
+take about 160\,ms. We cannot say whether the 4-node \kC{} failures come from the dropped
+NUMA-local structure, from stall exposure, or from both, or why only 8 nodes shows a
+position drift. Finally, we have no clean stall-free arm ordering. The 10th-percentile view
+is a low quantile of 40 launches, not a stall-free time, and where most launches stall, as
+on 4-node crankseg, even it is inflated.
+
+\section{Conclusions}
+\label{sec:conclusion}
+
+We measured whether replayed halo exchanges choose ABCG's best halo-exchange strategy on
+Dane, over 40 allocations at each of four node counts. The exact-matrix and per-rank
+Vernier replays choose within 30\% of ABCG's best at 24 and 23 of 24 design points, and
+every costly miss ranks the aggregating strategy too low, as H17 predicted.
+The job-wide Vernier histogram is enough at 8 and 16 nodes and fails at 4 of 12 points at
+2 and 4 nodes. It distorts the NUMA-local and off-node byte mix at every node count, so
+that distortion alone does not explain where it fails. ABCG's best
+strategy changes across matrices and scales at 2 to 8 nodes, with selection gains of 11 to
+44\%, and not at 16 nodes. Against MPI on ABCG's exchange, LOCALITY repays its setup in 9 to 40
+iterations on crankseg at 4 to 16 nodes, in tens to about a thousand on nd12k and nd24k,
+and in thousands or never on m\_t1 and x104. However, whole
+0.160\,s stalls on the non-aggregating strategies dominate run-to-run variation and decide
+several of these orderings, notably at 2 nodes, and until their cause is found, results on
+the crankseg matrices describe this machine as it behaved rather than the communication
+patterns alone.
+
+\bibliographystyle{plain}
+\bibliography{references}
+
+\appendix
+\section{Per-Design-Point Tables}
+\label{app:tables}
+
+This appendix gives the per-design-point numbers behind the summaries in
+\cref{sec:results}. All use 40 launches per design point with slow runs kept, and the
+arm abbreviations M (MPI), S (STANDARD), and L (LOCALITY).
+
+\subsection{H17: decision regret at every design point}
+
+\Cref{tab:app:h17abcgspmv,tab:app:h17abcgcg} give the decision regret
+summarized in \cref{tab:h17}. Small nonzero regrets with intervals touching 0, such as
+those at 2-node nd24k, come from medians within about 1\% of each other.
+
+
+\small
+\begin{longtable}{@{}rllp{2.9cm}p{2.9cm}p{2.9cm}@{}}
+\caption{Decision regret on \spmv{} (ABCG's SpMV exchange) at every design point, slow runs kept, 40 launches
+each. ``Best'' is the application's fastest arm by median (M = MPI, S = STANDARD, L =
+LOCALITY). Each stand-in cell gives the arm it chooses and the regret with its 95\%
+launch-bootstrap interval; ``0'' alone means the choice was right in every resample.}
+\label{tab:app:h17abcgspmv}\\
+\toprule
+Nodes & Matrix & Best & \kM & \kF & \kC \\
+\midrule
+\endfirsthead
+\toprule
+Nodes & Matrix & Best & \kM & \kF & \kC \\
+\midrule
+\endhead
+2 & crankseg\_1 & L & L 0.00 (0.00--1.20) & S 1.09 (0.00--1.58) & S 1.09 (0.26--1.96) \\
+2 & crankseg\_2 & L & L 0 & L 0 & S 1.16 (0.42--2.91) \\
+2 & nd12k & S & S 0 & S 0 & S 0 \\
+2 & nd24k & S & S 0.00 (0.00--0.01) & S 0.00 (0.00--0.01) & S 0.00 (0.00--0.01) \\
+2 & m\_t1 & S & S 0.00 (0.00--0.00) & S 0.00 (0.00--0.00) & S 0.00 (0.00--0.00) \\
+2 & x104 & S & S 0 & S 0 & S 0 \\
+\midrule
+4 & crankseg\_1 & L & L 0 & L 0 & S 7.48 (5.17--12.55) \\
+4 & crankseg\_2 & L & L 0 & L 0 & S 22.97 (16.38--95.94) \\
+4 & nd12k & L & S 0.30 (0.27--0.33) & S 0.30 (0.27--0.33) & S 0.30 (0.27--0.32) \\
+4 & nd24k & L & L 0 & L 0 & S 1.93 (1.28--2.49) \\
+4 & m\_t1 & S & S 0.00 (0.00--0.00) & S 0.00 (0.00--0.00) & S 0.00 (0.00--0.00) \\
+4 & x104 & S & S 0 & S 0 & S 0 \\
+\midrule
+8 & crankseg\_1 & L & L 0 & L 0 & L 0 \\
+8 & crankseg\_2 & L & L 0 & L 0 & L 0 \\
+8 & nd12k & L & L 0 & L 0 & L 0 \\
+8 & nd24k & L & L 0 & L 0 & L 0.00 (0.00--9.89) \\
+8 & m\_t1 & S & S 0.00 (0.00--0.01) & S 0.00 (0.00--0.01) & S 0.00 (0.00--0.01) \\
+8 & x104 & S & S 0.00 (0.00--0.01) & S 0.00 (0.00--0.01) & S 0.00 (0.00--0.01) \\
+\midrule
+16 & crankseg\_1 & L & L 0 & L 0 & L 0 \\
+16 & crankseg\_2 & L & L 0 & L 0 & L 0 \\
+16 & nd12k & L & L 0 & L 0 & L 0 \\
+16 & nd24k & L & L 0 & L 0 & L 0 \\
+16 & m\_t1 & L & S 0.09 (0.05--0.17) & S 0.09 (0.05--0.17) & S 0.09 (0.00--0.16) \\
+16 & x104 & L & S 0.06 (0.03--0.09) & S 0.06 (0.03--0.09) & S 0.06 (0.03--0.09) \\
+
+\bottomrule
+\end{longtable}
+\normalsize
+
+
+
+\small
+\begin{longtable}{@{}rllp{2.9cm}p{2.9cm}p{2.9cm}@{}}
+\caption{Decision regret on \cg{} (ABCG's CG iteration) at every design point, slow runs kept, 40 launches
+each. ``Best'' is the application's fastest arm by median (M = MPI, S = STANDARD, L =
+LOCALITY). Each stand-in cell gives the arm it chooses and the regret with its 95\%
+launch-bootstrap interval; ``0'' alone means the choice was right in every resample.}
+\label{tab:app:h17abcgcg}\\
+\toprule
+Nodes & Matrix & Best & \kM & \kF & \kC \\
+\midrule
+\endfirsthead
+\toprule
+Nodes & Matrix & Best & \kM & \kF & \kC \\
+\midrule
+\endhead
+2 & crankseg\_1 & L & L 0.00 (0.00--1.00) & S 1.01 (0.00--1.33) & S 1.01 (0.33--1.86) \\
+2 & crankseg\_2 & L & L 0 & L 0 & S 1.30 (0.22--2.93) \\
+2 & nd12k & M & S 0.02 (0.00--0.03) & S 0.02 (0.00--0.03) & S 0.02 (0.00--0.03) \\
+2 & nd24k & M & S 0.03 (0.02--0.04) & S 0.03 (0.02--0.04) & S 0.03 (0.02--0.04) \\
+2 & m\_t1 & M & S 0.00 (0.00--0.01) & S 0.00 (0.00--0.01) & S 0.00 (0.00--0.01) \\
+2 & x104 & M & S 0.04 (0.03--0.05) & S 0.04 (0.03--0.05) & S 0.04 (0.03--0.05) \\
+\midrule
+4 & crankseg\_1 & L & L 0 & L 0 & S 8.79 (5.58--11.22) \\
+4 & crankseg\_2 & L & L 0 & L 0 & S 31.29 (17.38--73.57) \\
+4 & nd12k & L & S 0.21 (0.19--0.26) & S 0.21 (0.19--0.26) & S 0.21 (0.19--0.26) \\
+4 & nd24k & L & L 0 & L 0 & S 1.39 (0.90--1.89) \\
+4 & m\_t1 & M & S 0.01 (0.00--0.03) & S 0.01 (0.00--0.03) & S 0.01 (0.00--0.03) \\
+4 & x104 & M & S 0.02 (0.01--0.04) & S 0.02 (0.01--0.04) & S 0.02 (0.01--0.04) \\
+\midrule
+8 & crankseg\_1 & L & L 0 & L 0 & L 0 \\
+8 & crankseg\_2 & L & L 0 & L 0 & L 0 \\
+8 & nd12k & L & L 0 & L 0 & L 0 \\
+8 & nd24k & L & L 0 & L 0 & L 0.00 (0.00--11.78) \\
+8 & m\_t1 & M & S 0.01 (0.00--0.03) & S 0.01 (0.00--0.03) & S 0.01 (0.00--0.03) \\
+8 & x104 & M & S 0.02 (0.00--0.03) & S 0.02 (0.00--0.03) & S 0.02 (0.00--0.03) \\
+\midrule
+16 & crankseg\_1 & L & L 0 & L 0 & L 0 \\
+16 & crankseg\_2 & L & L 0 & L 0 & L 0 \\
+16 & nd12k & L & L 0 & L 0 & L 0 \\
+16 & nd24k & L & L 0 & L 0 & L 0 \\
+16 & m\_t1 & L & S 0.07 (0.02--0.13) & S 0.07 (0.02--0.14) & S 0.07 (0.00--0.12) \\
+16 & x104 & L & S 0.02 (0.00--0.09) & S 0.02 (0.00--0.09) & S 0.02 (0.00--0.09) \\
+
+\bottomrule
+\end{longtable}
+\normalsize
+
+
+\subsection{H0: the application's best arm}
+
+\begin{table}[H]
+\centering
+\small
+\caption{The application's fastest arm by median $q$ at each design point. A number in
+parentheses is the share of 10,000 launch-bootstrap resamples in which that arm is
+fastest, shown when it is below 0.95.}
+\label{tab:app:h0}
+\begin{tabular}{@{}lllllllll@{}}
+\toprule
+& \multicolumn{4}{c}{\spmv, nodes} & \multicolumn{4}{c}{\cg, nodes} \\
+\cmidrule(lr){2-5}\cmidrule(l){6-9}
+Matrix & 2 & 4 & 8 & 16 & 2 & 4 & 8 & 16 \\
+\midrule
+crankseg\_1 & L & L & L & L & L & L & L & L \\
+crankseg\_2 & L & L & L & L & L & L & L & L \\
+nd12k & S & L & L & L & M & L & L & L \\
+nd24k & S (0.83) & L & L & L & M & L & L & L \\
+m\_t1 & S & S (0.90) & S (0.92) & L & M (0.58) & M & M (0.71) & L \\
+x104 & S & S & S (0.79) & L & M & M & M & L (0.75) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+
+\subsection{H8: break-even iteration counts}
+
+\Cref{tab:h8} gives $N^*$ for \spmv{} against MPI. The tables below give the
+remaining kinds and comparisons, with the conventions of \cref{sec:h8}: a number is $N^*$
+with its 95\% launch-bootstrap interval; ``never'' means LOCALITY never catches up;
+``always'' means it wins from the first iteration; ``until'' means it wins only below
+$N^*$. An $N^*$ that rounds to 0 means LOCALITY's extra setup is negligible, so it wins
+from about the first iteration; ``always'' means its setup is no larger and its $q$ is
+no larger.
+
+
+\begin{table}[H]
+\centering
+\footnotesize
+\setlength{\tabcolsep}{3.5pt}
+\caption{$N^*$ for LOCALITY against STANDARD on \spmv.}
+\label{tab:app:h8abcgspmvSTANDARD}
+\begin{tabular}{@{}rllllll@{}}
+\toprule
+Nodes & crankseg\_1 & crankseg\_2 & nd12k & nd24k & m\_t1 & x104 \\
+\midrule
+2 & 149 (91--577) & 124 (60--298) & never & never & never & never \\
+4 & 46 (26--65) & 28 (16--36) & 1,182 (1,090--1,330) & 132 (108--180) & never & never \\
+8 & 35 (14--45) & 38 (16--46) & 148 (112--207) & 94 (73--113) & never & never \\
+16 & 24 (11--35) & 12 (3--20) & 426 (360--530) & 57 (23--87) & 5,923 (3,274--11,142) & 6,453 (4,102--12,749) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+
+
+\begin{table}[H]
+\centering
+\footnotesize
+\setlength{\tabcolsep}{3.5pt}
+\caption{$N^*$ for LOCALITY against MPI on \cg.}
+\label{tab:app:h8abcgcgMPI}
+\begin{tabular}{@{}rllllll@{}}
+\toprule
+Nodes & crankseg\_1 & crankseg\_2 & nd12k & nd24k & m\_t1 & x104 \\
+\midrule
+2 & 103 (74--459) & 86 (55--231) & never & never & never & never \\
+4 & 31 (18--39) & 20 (13--29) & 778 (716--985) & 83 (60--123) & never & never \\
+8 & 21 (3--29) & 19 (7--30) & 70 (48--118) & 57 (40--65) & never & never \\
+16 & 16 (7--27) & 7 (1--15) & 299 (264--420) & 26 (12--44) & 2,449 (1,968--5,599) & 8,518 (3,389--65,722) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+
+
+\begin{table}[H]
+\centering
+\footnotesize
+\setlength{\tabcolsep}{3.5pt}
+\caption{$N^*$ for LOCALITY against STANDARD on \cg.}
+\label{tab:app:h8abcgcgSTANDARD}
+\begin{tabular}{@{}rllllll@{}}
+\toprule
+Nodes & crankseg\_1 & crankseg\_2 & nd12k & nd24k & m\_t1 & x104 \\
+\midrule
+2 & 108 (65--268) & 81 (49--219) & never & never & never & never \\
+4 & 24 (18--38) & 16 (12--28) & 795 (641--920) & 91 (75--132) & never & never \\
+8 & 13 (2--30) & 16 (9--29) & 80 (44--117) & 48 (19--59) & never & never \\
+16 & 15 (3--24) & 8 (2--14) & 274 (203--352) & 40 (24--61) & 3,645 (1,992--12,522) & 10,827 (1,826--104,421) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+
+
+\begin{table}[H]
+\centering
+\footnotesize
+\setlength{\tabcolsep}{3.5pt}
+\caption{$N^*$ for LOCALITY against MPI on \spmvnp.}
+\label{tab:app:h8abcgspmvnpMPI}
+\begin{tabular}{@{}rllllll@{}}
+\toprule
+Nodes & crankseg\_1 & crankseg\_2 & nd12k & nd24k & m\_t1 & x104 \\
+\midrule
+2 & 34 (23--262) & 31 (24--137) & never & never & never & never \\
+4 & 67 (6--284) & 25 (12--55) & never & never & never & never \\
+8 & until & 59 (5--604) & 98 (8--537) & always & until & until \\
+16 & always & always & never & always & never & never \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+
+
+\begin{table}[H]
+\centering
+\footnotesize
+\setlength{\tabcolsep}{3.5pt}
+\caption{$N^*$ for LOCALITY against STANDARD on \spmvnp.}
+\label{tab:app:h8abcgspmvnpSTANDARD}
+\begin{tabular}{@{}rllllll@{}}
+\toprule
+Nodes & crankseg\_1 & crankseg\_2 & nd12k & nd24k & m\_t1 & x104 \\
+\midrule
+2 & never & 79 (27--269) & never & never & never & never \\
+4 & 38 (2--185) & 23 (8--47) & never & never & never & never \\
+8 & never & 147 (2--3,377) & 44 (4--1,018) & always & until & until \\
+16 & 1 (0--15) & always & never & always & never & never \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+
+
+\begin{table}[H]
+\centering
+\footnotesize
+\setlength{\tabcolsep}{3.5pt}
+\caption{$N^*$ for LOCALITY against MPI on \cgnp.}
+\label{tab:app:h8abcgcgnpMPI}
+\begin{tabular}{@{}rllllll@{}}
+\toprule
+Nodes & crankseg\_1 & crankseg\_2 & nd12k & nd24k & m\_t1 & x104 \\
+\midrule
+2 & 25 (14--187) & 19 (2--74) & never & never & never & never \\
+4 & always & 38 (7--80) & never & until & never & never \\
+8 & until & never & 39 (5--335) & always & never & until \\
+16 & always & always & never & always & never & until \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+
+
+\begin{table}[H]
+\centering
+\footnotesize
+\setlength{\tabcolsep}{3.5pt}
+\caption{$N^*$ for LOCALITY against STANDARD on \cgnp.}
+\label{tab:app:h8abcgcgnpSTANDARD}
+\begin{tabular}{@{}rllllll@{}}
+\toprule
+Nodes & crankseg\_1 & crankseg\_2 & nd12k & nd24k & m\_t1 & x104 \\
+\midrule
+2 & 82 (18--184) & 35 (30--221) & never & never & never & never \\
+4 & 5 (1--137) & 42 (13--95) & never & until & never & never \\
+8 & until & until & 19 (5--100) & always & never & until \\
+16 & 9 (1--46) & always & never & always & never & until \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+
+
+\begin{table}[H]
+\centering
+\footnotesize
+\setlength{\tabcolsep}{3.5pt}
+\caption{$N^*$ for LOCALITY against MPI on \kM.}
+\label{tab:app:h8pmMPI}
+\begin{tabular}{@{}rllllll@{}}
+\toprule
+Nodes & crankseg\_1 & crankseg\_2 & nd12k & nd24k & m\_t1 & x104 \\
+\midrule
+2 & 298 (164--29,734) & 308 (89--2,349) & never & never & never & never \\
+4 & 29 (22--43) & 15 (6--26) & never & 72 (59--103) & never & never \\
+8 & always & 2 (1--8) & 20 (9--29) & 20 (3--29) & never & never \\
+16 & 3 (0--8) & 8 (0--13) & 33 (29--41) & always & never & never \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+
+
+\begin{table}[H]
+\centering
+\footnotesize
+\setlength{\tabcolsep}{3.5pt}
+\caption{$N^*$ for LOCALITY against STANDARD on \kM.}
+\label{tab:app:h8pmSTANDARD}
+\begin{tabular}{@{}rllllll@{}}
+\toprule
+Nodes & crankseg\_1 & crankseg\_2 & nd12k & nd24k & m\_t1 & x104 \\
+\midrule
+2 & 8,221 (228--31,997) & 181 (82--1,380) & never & never & never & never \\
+4 & 28 (14--37) & 24 (4--31) & never & 93 (65--105) & never & never \\
+8 & 0 (0--11) & 2 (1--8) & 21 (11--32) & 24 (10--28) & never & never \\
+16 & always & 1 (0--5) & 34 (29--45) & always & never & never \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+
+\subsection{H13: cells where the fastest arm is not the steadiest}
+
+\small
+\begin{longtable}{@{}lrlcrrrr@{}}
+\caption{The 36 cells in which the arm with the lowest median $q$ and the arm with the
+lowest spread differ, each with bootstrap probability at least 0.9. In every one, LOCALITY
+has the lowest spread. Columns give the median-best arm, the median $q$ in ms of that arm
+and of LOCALITY, and the MAD of $\ln q$ of each.}
+\label{tab:app:h13}\\
+\toprule
+& & & Median- & \multicolumn{2}{c}{median $q$ (ms)} & \multicolumn{2}{c}{MAD of $\ln q$} \\
+\cmidrule(lr){5-6}\cmidrule(l){7-8}
+Kind & Nodes & Matrix & best & best & L & best & L \\
+\midrule
+\endfirsthead
+\toprule
+Kind & Nodes & Matrix & Median-best & best & L & best & L \\
+\midrule
+\endhead
+\texttt{<m>} & 2 & nd12k & S & 0.161 & 0.353 & 0.044 & 0.007 \\
+\texttt{<m>} & 2 & x104 & S & 0.042 & 0.255 & 0.029 & 0.005 \\
+\texttt{<m>} & 2 & m\_t1 & S & 0.039 & 0.313 & 0.027 & 0.010 \\
+\texttt{<m>} & 2 & nd24k & S & 0.210 & 0.596 & 0.039 & 0.003 \\
+\texttt{<m>} & 4 & nd12k & S & 0.189 & 0.226 & 0.070 & 0.008 \\
+\texttt{<m>} & 4 & x104 & S & 0.050 & 0.228 & 0.019 & 0.009 \\
+\texttt{<m>} & 4 & m\_t1 & S & 0.043 & 0.195 & 0.026 & 0.015 \\
+\texttt{<m>} & 8 & x104 & S & 0.065 & 0.159 & 0.047 & 0.028 \\
+\texttt{<m>} & 8 & m\_t1 & S & 0.060 & 0.141 & 0.076 & 0.028 \\
+\texttt{<m>} & 16 & x104 & S & 0.077 & 0.124 & 0.067 & 0.030 \\
+\texttt{<m>} & 16 & m\_t1 & S & 0.075 & 0.105 & 0.156 & 0.041 \\
+\texttt{fine\_} & 2 & nd12k & S & 0.160 & 0.353 & 0.049 & 0.005 \\
+\texttt{fine\_} & 2 & x104 & S & 0.042 & 0.255 & 0.024 & 0.006 \\
+\texttt{fine\_} & 2 & m\_t1 & S & 0.039 & 0.312 & 0.028 & 0.010 \\
+\texttt{fine\_} & 2 & nd24k & S & 0.209 & 0.597 & 0.035 & 0.005 \\
+\texttt{fine\_} & 4 & nd12k & S & 0.185 & 0.228 & 0.054 & 0.010 \\
+\texttt{fine\_} & 4 & x104 & S & 0.050 & 0.228 & 0.020 & 0.008 \\
+\texttt{fine\_} & 4 & m\_t1 & S & 0.043 & 0.195 & 0.029 & 0.014 \\
+\texttt{fine\_} & 8 & m\_t1 & S & 0.061 & 0.141 & 0.058 & 0.024 \\
+\texttt{fine\_} & 16 & x104 & S & 0.079 & 0.124 & 0.085 & 0.023 \\
+\texttt{coarse\_} & 4 & crankseg\_2 & S & 0.247 & 0.276 & 0.071 & 0.029 \\
+\texttt{coarse\_} & 4 & nd12k & S & 0.197 & 0.228 & 0.058 & 0.013 \\
+\texttt{coarse\_} & 4 & crankseg\_1 & S & 0.205 & 0.221 & 0.065 & 0.023 \\
+\texttt{coarse\_} & 4 & nd24k & S & 0.282 & 0.355 & 0.046 & 0.020 \\
+\texttt{coarse\_} & 8 & x104 & S & 0.055 & 0.154 & 0.070 & 0.041 \\
+\texttt{coarse\_} & 16 & x104 & S & 0.065 & 0.096 & 0.077 & 0.044 \\
+\texttt{coarse\_} & 16 & m\_t1 & S & 0.075 & 0.079 & 0.178 & 0.062 \\
+abcgspmv & 2 & nd12k & S & 0.160 & 0.188 & 0.047 & 0.020 \\
+abcgspmv & 2 & x104 & S & 0.040 & 0.157 & 0.025 & 0.009 \\
+abcgspmv & 2 & m\_t1 & S & 0.041 & 0.203 & 0.029 & 0.010 \\
+abcgspmv & 4 & x104 & S & 0.047 & 0.139 & 0.027 & 0.011 \\
+abcgcg & 2 & x104 & M & 0.098 & 0.233 & 0.026 & 0.013 \\
+abcgcg & 2 & nd24k & M & 0.380 & 0.487 & 0.028 & 0.015 \\
+abcgcg & 4 & x104 & M & 0.089 & 0.192 & 0.022 & 0.013 \\
+abcgcg & 4 & m\_t1 & M & 0.080 & 0.173 & 0.033 & 0.013 \\
+abcgcgnp & 16 & x104 & M & 0.121 & 0.579 & 0.094 & 0.040 \\
+\bottomrule
+\end{longtable}
+\normalsize
+
+\FloatBarrier
+\section{All Figures}
+\label{app:figures}
+
+This appendix holds every figure the analysis produced, 98 in all, grouped by
+analysis. Figures already shown in \cref{sec:results} are referenced rather than repeated.
+Each group opens with how to read its figures; each caption names what differs.
+
+\FloatBarrier
+\subsection{Stalls}
+\label{app:fig:g1}
+
+The three stall figures are all in
+\cref{sec:stalls}.
+
+\FloatBarrier
+\subsection{H17: regret of each stand-in for each application}
+\label{app:fig:g2}
+
+Each figure shows, for one stand-in choosing the arm for one application at one node
+count, the regret per matrix. Black: decision regret with its 95\% launch-bootstrap
+interval. Blue: per-launch regret (square, median over launches; open triangle, worst
+launch). Red: the noise floor, the application predicting itself from a different launch
+(line, median; open triangle, expected maximum over 40 launches). The vertical axis is
+linear below 1\% and logarithmic above. 40 launches per matrix; slow runs kept.
+
+Shown in \cref{sec:results}: \cref{fig:regret_coarse_vs_abcgspmv_4nodes}, \cref{fig:regret_pm_vs_abcgspmv_4nodes}.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.6\textwidth]{regret_coarse_vs_abcgcg_2nodes.png}
+\caption{Cost of letting the coarse Vernier replay pick the arm for ABCG's CG iteration, 2 nodes.}
+\label{fig:regret_coarse_vs_abcgcg_2nodes}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.6\textwidth]{regret_coarse_vs_abcgcg_4nodes.png}
+\caption{Cost of letting the coarse Vernier replay pick the arm for ABCG's CG iteration, 4 nodes.}
+\label{fig:regret_coarse_vs_abcgcg_4nodes}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.6\textwidth]{regret_coarse_vs_abcgcg_8nodes.png}
+\caption{Cost of letting the coarse Vernier replay pick the arm for ABCG's CG iteration, 8 nodes.}
+\label{fig:regret_coarse_vs_abcgcg_8nodes}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.6\textwidth]{regret_coarse_vs_abcgcg_16nodes.png}
+\caption{Cost of letting the coarse Vernier replay pick the arm for ABCG's CG iteration, 16 nodes.}
+\label{fig:regret_coarse_vs_abcgcg_16nodes}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.6\textwidth]{regret_coarse_vs_abcgspmv_2nodes.png}
+\caption{Cost of letting the coarse Vernier replay pick the arm for ABCG's SpMV exchange, 2 nodes.}
+\label{fig:regret_coarse_vs_abcgspmv_2nodes}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.6\textwidth]{regret_coarse_vs_abcgspmv_8nodes.png}
+\caption{Cost of letting the coarse Vernier replay pick the arm for ABCG's SpMV exchange, 8 nodes.}
+\label{fig:regret_coarse_vs_abcgspmv_8nodes}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.6\textwidth]{regret_coarse_vs_abcgspmv_16nodes.png}
+\caption{Cost of letting the coarse Vernier replay pick the arm for ABCG's SpMV exchange, 16 nodes.}
+\label{fig:regret_coarse_vs_abcgspmv_16nodes}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.6\textwidth]{regret_fine_vs_abcgcg_2nodes.png}
+\caption{Cost of letting the fine Vernier replay pick the arm for ABCG's CG iteration, 2 nodes.}
+\label{fig:regret_fine_vs_abcgcg_2nodes}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.6\textwidth]{regret_fine_vs_abcgcg_4nodes.png}
+\caption{Cost of letting the fine Vernier replay pick the arm for ABCG's CG iteration, 4 nodes.}
+\label{fig:regret_fine_vs_abcgcg_4nodes}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.6\textwidth]{regret_fine_vs_abcgcg_8nodes.png}
+\caption{Cost of letting the fine Vernier replay pick the arm for ABCG's CG iteration, 8 nodes.}
+\label{fig:regret_fine_vs_abcgcg_8nodes}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.6\textwidth]{regret_fine_vs_abcgcg_16nodes.png}
+\caption{Cost of letting the fine Vernier replay pick the arm for ABCG's CG iteration, 16 nodes.}
+\label{fig:regret_fine_vs_abcgcg_16nodes}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.6\textwidth]{regret_fine_vs_abcgspmv_2nodes.png}
+\caption{Cost of letting the fine Vernier replay pick the arm for ABCG's SpMV exchange, 2 nodes.}
+\label{fig:regret_fine_vs_abcgspmv_2nodes}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.6\textwidth]{regret_fine_vs_abcgspmv_4nodes.png}
+\caption{Cost of letting the fine Vernier replay pick the arm for ABCG's SpMV exchange, 4 nodes.}
+\label{fig:regret_fine_vs_abcgspmv_4nodes}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.6\textwidth]{regret_fine_vs_abcgspmv_8nodes.png}
+\caption{Cost of letting the fine Vernier replay pick the arm for ABCG's SpMV exchange, 8 nodes.}
+\label{fig:regret_fine_vs_abcgspmv_8nodes}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.6\textwidth]{regret_fine_vs_abcgspmv_16nodes.png}
+\caption{Cost of letting the fine Vernier replay pick the arm for ABCG's SpMV exchange, 16 nodes.}
+\label{fig:regret_fine_vs_abcgspmv_16nodes}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.6\textwidth]{regret_pm_vs_abcgcg_2nodes.png}
+\caption{Cost of letting the matrix replay (\kM) pick the arm for ABCG's CG iteration, 2 nodes.}
+\label{fig:regret_pm_vs_abcgcg_2nodes}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.6\textwidth]{regret_pm_vs_abcgcg_4nodes.png}
+\caption{Cost of letting the matrix replay (\kM) pick the arm for ABCG's CG iteration, 4 nodes.}
+\label{fig:regret_pm_vs_abcgcg_4nodes}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.6\textwidth]{regret_pm_vs_abcgcg_8nodes.png}
+\caption{Cost of letting the matrix replay (\kM) pick the arm for ABCG's CG iteration, 8 nodes.}
+\label{fig:regret_pm_vs_abcgcg_8nodes}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.6\textwidth]{regret_pm_vs_abcgcg_16nodes.png}
+\caption{Cost of letting the matrix replay (\kM) pick the arm for ABCG's CG iteration, 16 nodes.}
+\label{fig:regret_pm_vs_abcgcg_16nodes}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.6\textwidth]{regret_pm_vs_abcgspmv_2nodes.png}
+\caption{Cost of letting the matrix replay (\kM) pick the arm for ABCG's SpMV exchange, 2 nodes.}
+\label{fig:regret_pm_vs_abcgspmv_2nodes}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.6\textwidth]{regret_pm_vs_abcgspmv_8nodes.png}
+\caption{Cost of letting the matrix replay (\kM) pick the arm for ABCG's SpMV exchange, 8 nodes.}
+\label{fig:regret_pm_vs_abcgspmv_8nodes}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.6\textwidth]{regret_pm_vs_abcgspmv_16nodes.png}
+\caption{Cost of letting the matrix replay (\kM) pick the arm for ABCG's SpMV exchange, 16 nodes.}
+\label{fig:regret_pm_vs_abcgspmv_16nodes}
+\end{figure}
+
+\FloatBarrier
+\subsection{H17: worst-case regret}
+\label{app:fig:g3}
+
+This figure is in \cref{sec:h17}.
+
+\FloatBarrier
+\subsection{H17: pairwise agreement}
+\label{app:fig:g4}
+
+Each figure shows, for one stand-in and one application, the share of launches in which
+the stand-in orders each pair of arms the same way as the application, per design point,
+with 95\% Wilson intervals. When the application's two arms are within 10\% of each other,
+either order counts as agreement. Grey marks the MPI-versus-STANDARD pair, which H17
+predicted would agree best. 40 launches per point; slow runs kept.
+
+Shown in \cref{sec:results}: \cref{fig:pairwise_agreement_pm_vs_abcgspmv}.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.6\textwidth]{pairwise_agreement_coarse_vs_abcgcg.png}
+\caption{Does the coarse Vernier replay order each pair of arms the way ABCG's CG iteration does?}
+\label{fig:pairwise_agreement_coarse_vs_abcgcg}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.6\textwidth]{pairwise_agreement_coarse_vs_abcgspmv.png}
+\caption{Does the coarse Vernier replay order each pair of arms the way ABCG's SpMV exchange does?}
+\label{fig:pairwise_agreement_coarse_vs_abcgspmv}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.6\textwidth]{pairwise_agreement_fine_vs_abcgcg.png}
+\caption{Does the fine Vernier replay order each pair of arms the way ABCG's CG iteration does?}
+\label{fig:pairwise_agreement_fine_vs_abcgcg}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.6\textwidth]{pairwise_agreement_fine_vs_abcgspmv.png}
+\caption{Does the fine Vernier replay order each pair of arms the way ABCG's SpMV exchange does?}
+\label{fig:pairwise_agreement_fine_vs_abcgspmv}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.6\textwidth]{pairwise_agreement_pm_vs_abcgcg.png}
+\caption{Does the matrix replay (\kM) order each pair of arms the way ABCG's CG iteration does?}
+\label{fig:pairwise_agreement_pm_vs_abcgcg}
+\end{figure}
+
+\FloatBarrier
+\subsection{H18: coarse replay choosing for the fine replay}
+\label{app:fig:g5}
+
+Each figure shows the regret when \kC{} chooses the arm for \kF{} at one node count, with
+the encodings of \cref{app:fig:g2}.
+
+Shown in \cref{sec:results}: \cref{fig:regret_coarse_vs_fine_4nodes}.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.6\textwidth]{regret_coarse_vs_fine_2nodes.png}
+\caption{Cost of letting the coarse Vernier replay pick the arm for the fine Vernier replay, 2 nodes.}
+\label{fig:regret_coarse_vs_fine_2nodes}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.6\textwidth]{regret_coarse_vs_fine_8nodes.png}
+\caption{Cost of letting the coarse Vernier replay pick the arm for the fine Vernier replay, 8 nodes.}
+\label{fig:regret_coarse_vs_fine_8nodes}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.6\textwidth]{regret_coarse_vs_fine_16nodes.png}
+\caption{Cost of letting the coarse Vernier replay pick the arm for the fine Vernier replay, 16 nodes.}
+\label{fig:regret_coarse_vs_fine_16nodes}
+\end{figure}
+
+\FloatBarrier
+\subsection{H18: pattern structure the coarse replay changes}
+\label{app:fig:g6}
+
+Each figure divides \kC's per-rank pattern quantities by \kM's at one node count, from
+MPI-arm runs; 1 means preserved. Quantities are mean and maximum messages per rank, mean
+and maximum bytes per rank, mean on-node and off-node partners and bytes, and mean bytes
+to the same and to other NUMA domains. Marker: median over 40 launches; bar: range over
+launches, since \kC{} draws a new pattern every run.
+
+Shown in \cref{sec:results}: \cref{fig:coarse_structure_ratio_4nodes}.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.6\textwidth]{coarse_structure_ratio_2nodes.png}
+\caption{What the coarse Vernier capture changes about the pattern, 2 nodes.}
+\label{fig:coarse_structure_ratio_2nodes}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.6\textwidth]{coarse_structure_ratio_8nodes.png}
+\caption{What the coarse Vernier capture changes about the pattern, 8 nodes.}
+\label{fig:coarse_structure_ratio_8nodes}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.6\textwidth]{coarse_structure_ratio_16nodes.png}
+\caption{What the coarse Vernier capture changes about the pattern, 16 nodes.}
+\label{fig:coarse_structure_ratio_16nodes}
+\end{figure}
+
+\FloatBarrier
+\subsection{H0: which arm is fastest}
+\label{app:fig:g7}
+
+Each figure shows, for one application at one node count, the share of 10,000
+launch-bootstrap resamples in which each arm has the lowest median $q$, per matrix. A single
+color is a clear winner; mixed colors mean the data cannot separate the arms. 40 launches
+per matrix; slow runs kept.
+
+Shown in \cref{sec:results}: \cref{fig:h0_best_arm_abcgspmv_2nodes}, \cref{fig:h0_best_arm_abcgspmv_16nodes}.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.6\textwidth]{h0_best_arm_abcgcg_2nodes.png}
+\caption{Which arm is fastest for ABCG's CG iteration, 2 nodes.}
+\label{fig:h0_best_arm_abcgcg_2nodes}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.6\textwidth]{h0_best_arm_abcgcg_4nodes.png}
+\caption{Which arm is fastest for ABCG's CG iteration, 4 nodes.}
+\label{fig:h0_best_arm_abcgcg_4nodes}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.6\textwidth]{h0_best_arm_abcgcg_8nodes.png}
+\caption{Which arm is fastest for ABCG's CG iteration, 8 nodes.}
+\label{fig:h0_best_arm_abcgcg_8nodes}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.6\textwidth]{h0_best_arm_abcgcg_16nodes.png}
+\caption{Which arm is fastest for ABCG's CG iteration, 16 nodes.}
+\label{fig:h0_best_arm_abcgcg_16nodes}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.6\textwidth]{h0_best_arm_abcgspmv_4nodes.png}
+\caption{Which arm is fastest for ABCG's SpMV exchange, 4 nodes.}
+\label{fig:h0_best_arm_abcgspmv_4nodes}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.6\textwidth]{h0_best_arm_abcgspmv_8nodes.png}
+\caption{Which arm is fastest for ABCG's SpMV exchange, 8 nodes.}
+\label{fig:h0_best_arm_abcgspmv_8nodes}
+\end{figure}
+
+\FloatBarrier
+\subsection{H0: selection gain}
+\label{app:fig:g8}
+
+Each figure shows the speedup of one application from choosing the arm per workload over
+the best single fixed arm. The left four points compare the six matrices at one node count;
+the right six compare the four node counts of one matrix. Points are medians and bars 95\%
+ranges over 2,000 cross-fitted splits (choose on half the launches, score on the other
+half). Slow runs kept.
+
+Shown in \cref{sec:results}: \cref{fig:h0_selection_gain_abcgspmv}.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.6\textwidth]{h0_selection_gain_abcgcg.png}
+\caption{Choosing the arm per workload vs. one fixed arm, ABCG's CG iteration.}
+\label{fig:h0_selection_gain_abcgcg}
+\end{figure}
+
+\FloatBarrier
+\subsection{Paired time ratios}
+\label{app:fig:g9}
+
+Each figure shows, at one node count, the per-launch ratio of one kind's $q$ to
+another's on the same arm, per matrix; points are medians over 40 launches with 95\% BCa
+intervals, one color per arm. Above 1 means the first kind is slower. The grey band is the
+$\pm10\%$ equivalence margin. Slow runs kept.
+
+Shown in \cref{sec:results}: \cref{fig:ratio_fine_vs_pm_4nodes}, \cref{fig:ratio_pm_vs_abcgspmv_4nodes}.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.6\textwidth]{ratio_abcgcg_vs_abcgcgnp_2nodes.png}
+\caption{Time of ABCG's CG iteration relative to ABCG's CG iteration (non-persistent), 2 nodes.}
+\label{fig:ratio_abcgcg_vs_abcgcgnp_2nodes}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.6\textwidth]{ratio_abcgcg_vs_abcgcgnp_4nodes.png}
+\caption{Time of ABCG's CG iteration relative to ABCG's CG iteration (non-persistent), 4 nodes.}
+\label{fig:ratio_abcgcg_vs_abcgcgnp_4nodes}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.6\textwidth]{ratio_abcgcg_vs_abcgcgnp_8nodes.png}
+\caption{Time of ABCG's CG iteration relative to ABCG's CG iteration (non-persistent), 8 nodes.}
+\label{fig:ratio_abcgcg_vs_abcgcgnp_8nodes}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.6\textwidth]{ratio_abcgcg_vs_abcgcgnp_16nodes.png}
+\caption{Time of ABCG's CG iteration relative to ABCG's CG iteration (non-persistent), 16 nodes.}
+\label{fig:ratio_abcgcg_vs_abcgcgnp_16nodes}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.6\textwidth]{ratio_abcgspmv_vs_abcgspmvnp_2nodes.png}
+\caption{Time of ABCG's SpMV exchange relative to ABCG's SpMV exchange (non-persistent), 2 nodes.}
+\label{fig:ratio_abcgspmv_vs_abcgspmvnp_2nodes}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.6\textwidth]{ratio_abcgspmv_vs_abcgspmvnp_4nodes.png}
+\caption{Time of ABCG's SpMV exchange relative to ABCG's SpMV exchange (non-persistent), 4 nodes.}
+\label{fig:ratio_abcgspmv_vs_abcgspmvnp_4nodes}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.6\textwidth]{ratio_abcgspmv_vs_abcgspmvnp_8nodes.png}
+\caption{Time of ABCG's SpMV exchange relative to ABCG's SpMV exchange (non-persistent), 8 nodes.}
+\label{fig:ratio_abcgspmv_vs_abcgspmvnp_8nodes}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.6\textwidth]{ratio_abcgspmv_vs_abcgspmvnp_16nodes.png}
+\caption{Time of ABCG's SpMV exchange relative to ABCG's SpMV exchange (non-persistent), 16 nodes.}
+\label{fig:ratio_abcgspmv_vs_abcgspmvnp_16nodes}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.6\textwidth]{ratio_coarse_vs_pm_2nodes.png}
+\caption{Time of the coarse Vernier replay relative to the matrix replay (\kM), 2 nodes.}
+\label{fig:ratio_coarse_vs_pm_2nodes}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.6\textwidth]{ratio_coarse_vs_pm_4nodes.png}
+\caption{Time of the coarse Vernier replay relative to the matrix replay (\kM), 4 nodes.}
+\label{fig:ratio_coarse_vs_pm_4nodes}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.6\textwidth]{ratio_coarse_vs_pm_8nodes.png}
+\caption{Time of the coarse Vernier replay relative to the matrix replay (\kM), 8 nodes.}
+\label{fig:ratio_coarse_vs_pm_8nodes}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.6\textwidth]{ratio_coarse_vs_pm_16nodes.png}
+\caption{Time of the coarse Vernier replay relative to the matrix replay (\kM), 16 nodes.}
+\label{fig:ratio_coarse_vs_pm_16nodes}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.6\textwidth]{ratio_fine_vs_pm_2nodes.png}
+\caption{Time of the fine Vernier replay relative to the matrix replay (\kM), 2 nodes.}
+\label{fig:ratio_fine_vs_pm_2nodes}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.6\textwidth]{ratio_fine_vs_pm_8nodes.png}
+\caption{Time of the fine Vernier replay relative to the matrix replay (\kM), 8 nodes.}
+\label{fig:ratio_fine_vs_pm_8nodes}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.6\textwidth]{ratio_fine_vs_pm_16nodes.png}
+\caption{Time of the fine Vernier replay relative to the matrix replay (\kM), 16 nodes.}
+\label{fig:ratio_fine_vs_pm_16nodes}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.6\textwidth]{ratio_pm_vs_abcgspmv_2nodes.png}
+\caption{Time of the matrix replay (\kM) relative to ABCG's SpMV exchange, 2 nodes.}
+\label{fig:ratio_pm_vs_abcgspmv_2nodes}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.6\textwidth]{ratio_pm_vs_abcgspmv_8nodes.png}
+\caption{Time of the matrix replay (\kM) relative to ABCG's SpMV exchange, 8 nodes.}
+\label{fig:ratio_pm_vs_abcgspmv_8nodes}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.6\textwidth]{ratio_pm_vs_abcgspmv_16nodes.png}
+\caption{Time of the matrix replay (\kM) relative to ABCG's SpMV exchange, 16 nodes.}
+\label{fig:ratio_pm_vs_abcgspmv_16nodes}
+\end{figure}
+
+\FloatBarrier
+\subsection{H13: median against spread}
+\label{app:fig:g10}
+
+Each figure plots, for one application at one node count, median $q$ against run-to-run
+spread (MAD of $\ln q$ over launches; 0.1 is about 10\%), one marker per arm (color) and
+matrix (shape), with 95\% launch-bootstrap intervals. Where a matrix's left-most and lowest
+markers differ in color, the fastest arm is not the steadiest. 40 launches per matrix; slow
+runs kept.
+
+Shown in \cref{sec:results}: \cref{fig:h13_median_vs_spread_abcgspmv_2nodes}.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.6\textwidth]{h13_median_vs_spread_abcgcg_2nodes.png}
+\caption{Fastest arm vs. steadiest arm, ABCG's CG iteration, 2 nodes.}
+\label{fig:h13_median_vs_spread_abcgcg_2nodes}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.6\textwidth]{h13_median_vs_spread_abcgcg_4nodes.png}
+\caption{Fastest arm vs. steadiest arm, ABCG's CG iteration, 4 nodes.}
+\label{fig:h13_median_vs_spread_abcgcg_4nodes}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.6\textwidth]{h13_median_vs_spread_abcgcg_8nodes.png}
+\caption{Fastest arm vs. steadiest arm, ABCG's CG iteration, 8 nodes.}
+\label{fig:h13_median_vs_spread_abcgcg_8nodes}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.6\textwidth]{h13_median_vs_spread_abcgcg_16nodes.png}
+\caption{Fastest arm vs. steadiest arm, ABCG's CG iteration, 16 nodes.}
+\label{fig:h13_median_vs_spread_abcgcg_16nodes}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.6\textwidth]{h13_median_vs_spread_abcgspmv_4nodes.png}
+\caption{Fastest arm vs. steadiest arm, ABCG's SpMV exchange, 4 nodes.}
+\label{fig:h13_median_vs_spread_abcgspmv_4nodes}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.6\textwidth]{h13_median_vs_spread_abcgspmv_8nodes.png}
+\caption{Fastest arm vs. steadiest arm, ABCG's SpMV exchange, 8 nodes.}
+\label{fig:h13_median_vs_spread_abcgspmv_8nodes}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.6\textwidth]{h13_median_vs_spread_abcgspmv_16nodes.png}
+\caption{Fastest arm vs. steadiest arm, ABCG's SpMV exchange, 16 nodes.}
+\label{fig:h13_median_vs_spread_abcgspmv_16nodes}
+\end{figure}
+
+\FloatBarrier
+\subsection{H8: break-even iteration counts}
+\label{app:fig:g11}
+
+Each figure shows $N^*$ for LOCALITY against one other arm on one kind, per matrix, with
+one marker shape per node count and 95\% launch-bootstrap intervals. Black: LOCALITY wins
+after $N^*$ (plotted at 1 if it wins from the start). Red at the top: LOCALITY never wins.
+Red elsewhere: LOCALITY wins only below $N^*$. Dotted lines: the 22 and 40 iterations of
+Collom et al.~\cite{collom2023}. 40 launches per point; slow runs kept.
+
+Shown in \cref{sec:results}: \cref{fig:h8_nstar_abcgspmv_LOCALITY_vs_MPI}.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.6\textwidth]{h8_nstar_abcgcg_LOCALITY_vs_MPI.png}
+\caption{Iterations before LOCALITY beats MPI, ABCG's CG iteration.}
+\label{fig:h8_nstar_abcgcg_LOCALITY_vs_MPI}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.6\textwidth]{h8_nstar_abcgcg_LOCALITY_vs_STANDARD.png}
+\caption{Iterations before LOCALITY beats STANDARD, ABCG's CG iteration.}
+\label{fig:h8_nstar_abcgcg_LOCALITY_vs_STANDARD}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.6\textwidth]{h8_nstar_abcgcgnp_LOCALITY_vs_MPI.png}
+\caption{Iterations before LOCALITY beats MPI, ABCG's CG iteration (non-persistent).}
+\label{fig:h8_nstar_abcgcgnp_LOCALITY_vs_MPI}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.6\textwidth]{h8_nstar_abcgcgnp_LOCALITY_vs_STANDARD.png}
+\caption{Iterations before LOCALITY beats STANDARD, ABCG's CG iteration (non-persistent).}
+\label{fig:h8_nstar_abcgcgnp_LOCALITY_vs_STANDARD}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.6\textwidth]{h8_nstar_abcgspmv_LOCALITY_vs_STANDARD.png}
+\caption{Iterations before LOCALITY beats STANDARD, ABCG's SpMV exchange.}
+\label{fig:h8_nstar_abcgspmv_LOCALITY_vs_STANDARD}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.6\textwidth]{h8_nstar_abcgspmvnp_LOCALITY_vs_MPI.png}
+\caption{Iterations before LOCALITY beats MPI, ABCG's SpMV exchange (non-persistent).}
+\label{fig:h8_nstar_abcgspmvnp_LOCALITY_vs_MPI}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.6\textwidth]{h8_nstar_abcgspmvnp_LOCALITY_vs_STANDARD.png}
+\caption{Iterations before LOCALITY beats STANDARD, ABCG's SpMV exchange (non-persistent).}
+\label{fig:h8_nstar_abcgspmvnp_LOCALITY_vs_STANDARD}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.6\textwidth]{h8_nstar_pm_LOCALITY_vs_MPI.png}
+\caption{Iterations before LOCALITY beats MPI, the matrix replay (\kM).}
+\label{fig:h8_nstar_pm_LOCALITY_vs_MPI}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.6\textwidth]{h8_nstar_pm_LOCALITY_vs_STANDARD.png}
+\caption{Iterations before LOCALITY beats STANDARD, the matrix replay (\kM).}
+\label{fig:h8_nstar_pm_LOCALITY_vs_STANDARD}
+\end{figure}
+
+\FloatBarrier
+\subsection{Order and variance}
+\label{app:fig:g12}
+
+The position figure is in \cref{sec:order}. Each variance figure shows, at one node
+count, the variance of $\ln q$ after removing each cell's mean, split into a shift shared by
+every run in a launch (blue) and each run's own deviation (orange), for all kinds together
+and per kind. In each pair, the left bar keeps all runs and the faded right bar drops slow
+runs. 40 launches.
+
+Shown in \cref{sec:results}: \cref{fig:position_effect_by_nodes}, \cref{fig:variance_share_4nodes}.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.6\textwidth]{variance_share_2nodes.png}
+\caption{How much variation a whole launch shares, 2 nodes.}
+\label{fig:variance_share_2nodes}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.6\textwidth]{variance_share_8nodes.png}
+\caption{How much variation a whole launch shares, 8 nodes.}
+\label{fig:variance_share_8nodes}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.6\textwidth]{variance_share_16nodes.png}
+\caption{How much variation a whole launch shares, 16 nodes.}
+\label{fig:variance_share_16nodes}
+\end{figure}
+
+\FloatBarrier
+\subsection{ABCG's SpMV exchange as a stand-in for its CG iteration}
+\label{app:fig:g13}
+
+These figures treat \spmv{} as a fourth stand-in alongside \kM, \kF, and \kC, each
+choosing the arm for \cg. They extend \cref{sec:h17}, which uses \spmv{} and \cg{} as two
+separate applications. The dashed line in the regret figures marks 10\%, a looser
+threshold than the 5\% used in \cref{tab:h17}. As a stand-in for \cg, \spmv{} has a
+worst-case decision regret of 0.042 and never exceeds 5\%, against worst cases of 0.21 for
+\kM, 1.01 for \kF, and 31.3 for \kC. A CG iteration includes the SpMV exchange, the local multiply, two allreduces,
+and vector updates, so a stand-in's time per iteration below CG's is expected. 40 launches
+per design point; slow runs kept.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.6\textwidth]{ladder_regret_vs_cg.png}
+\caption{Cost of letting each stand-in pick the arm for ABCG's CG. Decision regret on \cg{} at every design point, one color per stand-in, with 95\% launch-bootstrap intervals.}
+\label{fig:ladder_regret_vs_cg}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.6\textwidth]{ladder_time_ratio_vs_cg.png}
+\caption{Time per iteration of each stand-in relative to ABCG's CG. Median over launches of the per-launch ratio of each stand-in's $q$ to \cg's on the same arm (color), one point per design point.}
+\label{fig:ladder_time_ratio_vs_cg}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.6\textwidth]{ladder_worst_regret_vs_cg.png}
+\caption{Worst-case cost of each stand-in's arm choice for ABCG's CG. For each stand-in, the largest decision regret on \cg{} over the 24 design points; the label above each bar counts design points where regret exceeds 10\%.}
+\label{fig:ladder_worst_regret_vs_cg}
+\end{figure}
+
+\end{document}
