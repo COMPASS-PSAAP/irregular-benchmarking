@@ -19,6 +19,7 @@ strategies for reducing per-rank memory overhead.
 - [locality_aware](https://github.com/mpi-advance/locality_aware) (a.k.a. MPI_Advance; provides the locality-aware MPI extensions used for halo exchange)
 - [TCLAP](https://github.com/mirror/tclap)
 - [nlohmann/json](https://github.com/nlohmann/json)
+- zlib (compresses the `--iter-prefix` files)
 
 ### Spack environment
 
@@ -87,6 +88,9 @@ make
 | `-r` | `--report-params` | Print the resolved run configuration before benchmarking | off |
 | `-N` | `--nosy-percent` | Percent chance (0-100) a rank sleeps before each gather, simulating a noisy neighbor | `0` |
 | `-T` | `--nosy-time` | Sleep duration in ms when acting as a noisy neighbor | `0` |
+| | `--iter-prefix` | Record every gather's time and write `PREFIX_<pattern>_s<sample>.iter.npy` after each sample (see below) | off |
+| | `--iter-raw` | With `--iter-prefix`, also write `.raw.npy` with every rank's rows and `.offsets.npy` with their clock offsets | off |
+| | `--iter-compress` | With `--iter-prefix`, gzip the files (`.npy.gz`) | off |
 | `-d` | `--distribution` | Accepted for `gaussian`\|`empirical`\|`static` but not currently consumed by the benchmark loop | `gaussian` |
 
 For each pattern in the config file, the benchmark draws `--samples` random
@@ -136,6 +140,60 @@ of every pattern.
 
 `--report-params` also prints the seed, the MPI library version, and
 the compiler version.
+
+### Per-iteration times
+
+The rows above are totals over `k` and `n` gathers. They cannot show whether a
+slow sample had one long gather or many slow ones, or which rank was slow. With
+`--iter-prefix PREFIX`, each rank keeps every gather's time in memory (16 bytes
+per gather, reserved before the loop) and, after the sample, writes
+`PREFIX_<pattern>_s<sample>.iter.npy`: a numpy array with one row per gather,
+window gathers first, reduced over ranks after timing. Its fields:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `start_s` | f8 | rank 0's wall-clock start of the gather, seconds since the epoch (`system_clock`) |
+| `apply_max_ms`, `apply_min_ms`, `apply_mean_ms` | f4 | over ranks, the apply alone, stopped before the `-b` barrier |
+| `slowest_rank` | i4 | the rank with the largest apply |
+| `iter_max_ms`, `iter_min_ms` | f4 | over ranks, the gather through the barrier: the time the totals sum |
+| `iter_min_rank` | i4 | the rank with the smallest barrier-inclusive time |
+
+`iter_min_rank` names the rank the others waited for when it was delayed outside
+`apply()`, for example between gathers (as a `-N` sleep is): that rank reaches
+the barrier last, waits least, and its own apply looks normal, so `slowest_rank`
+misses it. `start_s` places gathers in time across nodes and jobs, up to the
+nodes' clock offsets; durations come from the benchmark's own timer, which is
+`std::chrono::steady_clock` (monotonic; ABCG's `MPI_Wtime` is `CLOCK_MONOTONIC`
+in Open MPI 4.1 on Linux).
+`--iter-raw` also writes `PREFIX_<pattern>_s<sample>.raw.npy`, shape
+(ranks, gathers), with each rank's `start_s`, `apply_ms`, and `iter_ms`, sent to
+rank 0 in rank order and written there (collective MPI-IO took about 10 minutes
+per run on Dane's NFS workspace). That is 16 bytes per rank per gather, about 37 GB for
+one 2-node launch of the 2026-10-13 campaign, so it is for targeted runs.
+Each sample prints `-iter write (s):`, the time rank 0 took to write its files
+(after timing, outside every timed interval). Durations are stored as float32
+(about 10 ns resolution at 160 ms), so a
+per-rank sum of `iter_ms` matches `startupWindow`/`timedTotal` to about 1e-6
+relative. Read either file with `np.load(path)`. `--iter-compress` gzips every
+file (`.npy.gz`, read with `np.load(gzip.open(path))`); it is off by default
+because on Dane it saved only about 1.27x and did not shorten the write (2-node
+test, 2026-10-15: 0.03-0.47 s per run either way).
+
+`--iter-raw` also writes `PREFIX_<pattern>_s<sample>.offsets.npy`: each rank's
+wall-clock offset from rank 0, measured just before and just after the timed loop
+(outside every timed interval) by a ping-pong from rank 0 (50 rounds per rank, the
+smallest round trip kept), with that round trip (`t_before_s`, `offset_before_s`,
+`rtt_before_s`, `t_after_s`, `offset_after_s`, `rtt_after_s`; seconds). It makes
+`start_s` comparable across nodes to about ±rtt/2. Under `-b` each `start_s` is taken
+just after the rank leaves the previous barrier, so `scripts/barrier-skew.py RAW
+OFFSETS [BINDING]` gives each barrier's exit skew (latest minus earliest corrected
+exit), its median, p90, p99, and maximum, the ranks (and, with provenance.sh's
+`.binding.txt`, the nodes) most often last out, and the correction's uncertainty,
+saying so when the skew is below it. Not valid with `-N`/`-T`, whose sleep falls
+between the barrier and `start_s`. `start_s` is float64 epoch seconds and quantizes
+at about 0.24 µs. ABCG's `benchmark_spmv` writes the same files, and its
+`benchmark_cg_pilot` writes `iter_*` and `slowest_rank`/`iter_min_rank` only (it
+has no barrier to stop before).
 
 ### Matrix input
 
@@ -195,7 +253,26 @@ uncommitted diff, the Spack builds of localityaware, cabana, and kokkos and
 the state of their dev checkouts (with `PROV_SPACK_ENV` set), each input's
 hash and pattern names (for a Vernier capture directory, its per-rank files
 hashed together and the capture's `vernier_settings`), and the MPI- and
-Slurm-related environment.
+Slurm-related environment. On every node of the job it reads the clock source, the
+CPU frequency driver, governor, limits, and turbo setting, the CPU model, each
+InfiniBand/Omni-Path device with its port state and rate, UCX transports, libfabric
+providers, and network PCI devices (`.nodes.txt`, with the script that read them in
+`.nodes.sh`), and summarizes each as its distinct values with node counts, so a node
+that differs stands out. Under MPI it lists the pml, mtl, and btl components this
+Open MPI has; which one a run picks is not recorded. It also records the binary's own `PROVENANCE` line and
+its `ldd` output, and says whether the binary's locality_aware is a Spack install,
+because the Spack lines describe the environment, not necessarily the build.
+
+Every binary carries a `PROVENANCE: source=<commit> locality_aware=<commit>` string
+that `strings` finds, and prints both under `-r` (`-source commit:`,
+`-locality_aware commit:`), next to `-MPI_Wtick` and the resolution of
+`CLOCK_MONOTONIC`, which `steady_clock` uses. CMake takes them from `-DSOURCE_COMMIT` and
+`-DLOCALITY_AWARE_COMMIT`, which `scripts/dane/build_step_bench.sh` passes (the
+archived commit, or `uncommitted: <dir>` for a `BENCH_SRC` build, plus any patch it
+applied). Without `-DSOURCE_COMMIT`, CMake reads `git rev-parse HEAD` at configure
+time (`-dirty` with uncommitted changes to tracked files), only when the source
+directory is the top of its own checkout, and otherwise records `unknown (not a git
+checkout)`. It is read at configure time, so reconfigure after committing.
 Pass it the benchmark's own srun geometry so the binding it records matches:
 
 ```bash
@@ -239,9 +316,10 @@ each script, so the checkout path (`REPO`), `BINARY`, and `PROV_SPACK_ENV` are
 set at the top of `pilot.sbatch` and `gatherdata.sbatch`; edit them for your
 own checkout. Both scripts also take `BINARY` and `EXTRA_ARGS` from the
 environment at submission, e.g. to run a build against another locality_aware
-with `-s NUMA`, and record both in `launch_settings`. When `BINARY` was built
-from a git archive rather than a checkout, also set `BENCH_COMMIT`, since
-provenance.sh then has no repository to read the commit from.
+with `-s NUMA`, and record both in `launch_settings`, together with each
+binary's compiled-in `PROVENANCE` line (see "Recording provenance"). `BENCH_COMMIT`,
+if set, is recorded as a note; binaries built by `scripts/dane/build_step_bench.sh`
+carry their commit themselves.
 
 `submit.sh` takes two more settings from the environment. `MAX_RUNNING`, if
 set, makes launch i also wait (`afterany`) for launch i - `MAX_RUNNING`, so at
@@ -264,7 +342,17 @@ its allreduce with `ALLREDUCE_PMPI`. `ABCG_PERSISTENT` (`on`, the default,
 `off`, or `on off`) picks the MPI Advance neighbor alltoallv: persistent
 (init once, then start/wait) as `abcgspmv_`/`abcgcg_` patterns, one call per
 exchange as `abcgspmvnp_`/`abcgcgnp_` patterns, each with its own pilot.
-`ABCG_EXTRA_ARGS` reaches every ABCG run.
+`ABCG_EXTRA_ARGS` reaches every ABCG run, and `ABCG_CG_ARGS` only the
+`benchmark_cg_pilot` runs (e.g. `--max-iter 5000 --ignore-convergence`); both are
+recorded in `launch_settings`.
+
+`ITER=1` (environment, both sbatch scripts) gives every benchmark and ABCG run
+`--iter-prefix <run file without .txt>`, so each run's per-iteration file sits
+next to its output; `ITER_RAW=1` adds `--iter-raw` and `ITER_COMPRESS=1`
+`--iter-compress`; `launch_settings` records all three. Off by default. The
+reduced files take 28-36 bytes per iteration: at the 2026-10-13 campaign's 10 s
+target, about 0.4 GB per 2-node launch and 40 GB for all 160 launches, so a
+shorter `TARGET_SECONDS` is the way to cut it.
 
 `VERNIER_SPMV`, if set, is ABCG's `benchmark_spmv` built with `ABCG_VERNIER`
 (MPI arm only, no MPI Advance). Before the pilots, `pilot.sbatch` captures one

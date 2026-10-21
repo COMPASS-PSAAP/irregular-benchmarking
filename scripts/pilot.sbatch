@@ -23,6 +23,7 @@ ABCG_SPMV=${ABCG_SPMV:-}
 ABCG_CG=${ABCG_CG:-}
 ABCG_PERSISTENT=${ABCG_PERSISTENT:-on}
 ABCG_EXTRA_ARGS=${ABCG_EXTRA_ARGS:-}   # extra flags for every ABCG run
+ABCG_CG_ARGS=${ABCG_CG_ARGS:-}   # extra flags for benchmark_cg_pilot runs only, e.g. "--max-iter 5000 --ignore-convergence"
 # VERNIER_SPMV (env), if set, is ABCG's benchmark_spmv built with ABCG_VERNIER (MPI arm
 # only, no MPI Advance). Before the pilots, it captures one SpMV exchange of each .pm
 # input, one srun each, in INPUTS order, into capture/NN_<matrix>/; capture/order.csv
@@ -32,6 +33,14 @@ ABCG_EXTRA_ARGS=${ABCG_EXTRA_ARGS:-}   # extra flags for every ABCG run
 # recorded sends), which are piloted like any other input and listed in generated_inputs
 # for gatherdata.sbatch.
 VERNIER_SPMV=${VERNIER_SPMV:-}
+# ITER=1 (env) makes every benchmark and ABCG run record each iteration's time, written
+# next to its output file as <output without .txt>_<pattern>_s<sample>.iter.npy: one
+# row per iteration, reduced over ranks (README, "Per-iteration times"). ITER_RAW=1 adds
+# .raw.npy with every rank's rows (and .offsets.npy), which is large (about 16 B per rank per iteration),
+# so it is meant for targeted runs rather than campaigns. ITER_COMPRESS=1 gzips them (.npy.gz).
+ITER=${ITER:-}
+ITER_RAW=${ITER_RAW:-}
+ITER_COMPRESS=${ITER_COMPRESS:-}
 export PROV_SPACK_ENV=/g/g20/bacon4/spackenvs/spack-k5   # read by provenance.sh
 PILOT_K=25
 PILOT_N=100
@@ -83,6 +92,10 @@ for program in "${abcg_programs[@]}"; do
     read -r prefix bin mode <<< "$program"
     [ -x "$bin" ] || { echo "$prefix program not executable: $bin" >&2; exit 1; }
 done
+if [ "$ITER" != 1 ] && [ -n "$ITER_RAW$ITER_COMPRESS" ]; then
+    echo "ITER_RAW and ITER_COMPRESS need ITER=1" >&2
+    exit 1
+fi
 if [ -n "$VERNIER_SPMV" ]; then
     [ -x "$VERNIER_SPMV" ] || { echo "VERNIER_SPMV not executable: $VERNIER_SPMV" >&2; exit 1; }
     case ",$inputs," in
@@ -97,17 +110,30 @@ mkdir -p "$out_dir"
 "$REPO/scripts/provenance.sh" "$out_dir" "$BINARY" "$inputs" -- \
     --nodes="$nodes" --ntasks-per-node="$SLURM_NTASKS_PER_NODE"
 {
-    echo "binary: $BINARY"
+    echo "binary: $BINARY ($(strings "$BINARY" | grep -m1 '^PROVENANCE: ' || echo 'no PROVENANCE line'))"
     echo "extra args: $EXTRA_ARGS"
     echo "benchmark commit: ${BENCH_COMMIT:-see provenance}"
     echo "inputs: $inputs"
     for program in "${abcg_programs[@]}"; do
         read -r prefix bin mode <<< "$program"
-        echo "$prefix binary: $bin (sha256 $(sha256sum "$bin" | cut -d' ' -f1)), persistent $mode"
+        echo "$prefix binary: $bin (sha256 $(sha256sum "$bin" | cut -d' ' -f1), $(strings "$bin" | grep -m1 '^PROVENANCE: ' || echo 'no PROVENANCE line')), persistent $mode"
     done
     [ ${#abcg_programs[@]} -gt 0 ] && echo "abcg extra args: $ABCG_EXTRA_ARGS"
+    [ -n "$ABCG_CG" ] && echo "abcg cg args: $ABCG_CG_ARGS"
+    echo "per-iteration files: ITER=${ITER:-0} ITER_RAW=${ITER_RAW:-0} ITER_COMPRESS=${ITER_COMPRESS:-0}"
     [ -n "$VERNIER_SPMV" ] && echo "vernier capture: $out_dir/capture (see vernier_settings and order.csv there)"
 } > "$out_dir/launch_settings"
+
+# Sets iter_args to the per-iteration flags for the run whose output file is $1; empty
+# unless ITER=1.
+iter_args_for() {
+    iter_args=()
+    [ "$ITER" = 1 ] || return 0
+    iter_args=(--iter-prefix "${1%.txt}")
+    [ "$ITER_RAW" = 1 ] && iter_args+=(--iter-raw)
+    [ "$ITER_COMPRESS" = 1 ] && iter_args+=(--iter-compress)
+    return 0
+}
 
 if [ -n "$VERNIER_SPMV" ]; then
     capture_dir=$out_dir/capture
@@ -119,7 +145,7 @@ if [ -n "$VERNIER_SPMV" ]; then
     # histograms do not use them.
     capture_env="VERNIER_NO_REQUESTS=1"
     {
-        echo "capture program: $VERNIER_SPMV (sha256 $(sha256sum "$VERNIER_SPMV" | cut -d' ' -f1))"
+        echo "capture program: $VERNIER_SPMV (sha256 $(sha256sum "$VERNIER_SPMV" | cut -d' ' -f1), $(strings "$VERNIER_SPMV" | grep -m1 '^PROVENANCE: ' || echo 'no PROVENANCE line'))"
         echo "libvernier: $vernier_lib (sha256 $(sha256sum "$vernier_lib" | cut -d' ' -f1))"
         echo "vernier commit: $(cat "$(dirname "$vernier_lib")/../vernier-commit" 2>/dev/null || echo unknown)"
         echo "capture command: srun --nodes=$nodes --ntasks-per-node=$SLURM_NTASKS_PER_NODE $VERNIER_SPMV MATRIX.pm -c MPI -k 0 -n 1 -W none"
@@ -152,9 +178,10 @@ fi
 expected=0
 for input_file in "${input_files[@]}"; do
     pilot_file=$out_dir/pilot_$(basename "$input_file")_$(date +%Y%m%d-%H%M%S).txt
+    iter_args_for "$pilot_file"
     srun --nodes="$nodes" --ntasks-per-node="$SLURM_NTASKS_PER_NODE" "$BINARY" \
         -r -c MPIA -a STANDARD -x EXPORT -q -b -W "$warmup" -I 1 \
-        -k "$PILOT_K" -n "$PILOT_N" --calc "$target_seconds" $EXTRA_ARGS -f "$input_file" \
+        -k "$PILOT_K" -n "$PILOT_N" --calc "$target_seconds" $EXTRA_ARGS "${iter_args[@]}" -f "$input_file" \
         > "$pilot_file" 2>&1 < /dev/null
     # "(pattern_0)  calc: q Q ms  startup S ms  n N  (budget T s, k K)" -> "pattern_0 K N"
     grep 'calc:' "$pilot_file" | awk '{gsub(/[()]/, "", $1); gsub(/\)/, "", $15); print $1, $15, $10}' \
@@ -170,9 +197,12 @@ for input_file in "${input_files[@]}"; do
         read -r prefix bin mode <<< "$program"
         pattern=${prefix}_$(basename "$input_file" .pm)
         pilot_file=$out_dir/pilot_${pattern}_$(date +%Y%m%d-%H%M%S).txt
+        iter_args_for "$pilot_file"
+        program_args=
+        [ "${prefix#abcgcg}" != "$prefix" ] && program_args=$ABCG_CG_ARGS
         srun --nodes="$nodes" --ntasks-per-node="$SLURM_NTASKS_PER_NODE" "$bin" "$input_file" \
             -c STANDARD -P "$pattern" -W "$warmup" -k "$PILOT_K" -n "$PILOT_N" \
-            --calc "$target_seconds" --persistent "$mode" $ABCG_EXTRA_ARGS \
+            --calc "$target_seconds" --persistent "$mode" $ABCG_EXTRA_ARGS $program_args "${iter_args[@]}" \
             > "$pilot_file" 2>&1 < /dev/null
         grep 'calc:' "$pilot_file" | awk '{gsub(/[()]/, "", $1); gsub(/\)/, "", $15); print $1, $15, $10}' \
             >> "$out_dir/targets"

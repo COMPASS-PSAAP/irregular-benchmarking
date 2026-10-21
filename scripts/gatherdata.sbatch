@@ -25,6 +25,15 @@ ABCG_CG=${ABCG_CG:-}
 ABCG_SPMV_MPI=${ABCG_SPMV_MPI:-}
 ABCG_CG_MPI=${ABCG_CG_MPI:-}
 ABCG_EXTRA_ARGS=${ABCG_EXTRA_ARGS:-}
+ABCG_CG_ARGS=${ABCG_CG_ARGS:-}   # extra flags for benchmark_cg_pilot runs only, e.g. "--max-iter 5000 --ignore-convergence"
+# ITER=1 (env) makes every benchmark and ABCG run record each iteration's time, written
+# next to its output file as <output without .txt>_<pattern>_s<sample>.iter.npy: one
+# row per iteration, reduced over ranks (README, "Per-iteration times"). ITER_RAW=1 adds
+# .raw.npy with every rank's rows (and .offsets.npy), which is large (about 16 B per rank per iteration),
+# so it is meant for targeted runs rather than campaigns. ITER_COMPRESS=1 gzips them (.npy.gz).
+ITER=${ITER:-}
+ITER_RAW=${ITER_RAW:-}
+ITER_COMPRESS=${ITER_COMPRESS:-}
 export PROV_SPACK_ENV=/g/g20/bacon4/spackenvs/spack-k5   # read by provenance.sh
 SAMPLES=1      # times each pattern is run on each arm, in shuffled order
 ARMS="MPI STANDARD LOCALITY"   # MPI: plain MPI (-c MPI); the others: MPI Advance -a
@@ -80,6 +89,10 @@ for program in "abcgspmv $ABCG_SPMV" "abcgcg $ABCG_CG"; do
         exit 1
     fi
 done
+if [ "$ITER" != 1 ] && [ -n "$ITER_RAW$ITER_COMPRESS" ]; then
+    echo "ITER_RAW and ITER_COMPRESS need ITER=1" >&2
+    exit 1
+fi
 for bin in "$ABCG_SPMV_MPI" "$ABCG_CG_MPI"; do
     [ -z "$bin" ] || [ -x "$bin" ] || { echo "ABCG MPI-only program not executable: $bin" >&2; exit 1; }
 done
@@ -112,17 +125,30 @@ done > "$out_dir/pattern_files"
 # actually run is kept in schedule. Every arm uses the n the STANDARD pilot found.
 # The shuffle is seeded, and the seed is saved, so the same targets and seed
 # give the same order again.
-echo "binary: $BINARY" > "$out_dir/launch_settings"
+echo "binary: $BINARY ($(strings "$BINARY" | grep -m1 '^PROVENANCE: ' || echo 'no PROVENANCE line'))" > "$out_dir/launch_settings"
 echo "extra args: $EXTRA_ARGS" >> "$out_dir/launch_settings"
 echo "benchmark commit: ${BENCH_COMMIT:-see provenance}" >> "$out_dir/launch_settings"
 echo "inputs: $inputs" >> "$out_dir/launch_settings"
 for program in "abcgspmv $ABCG_SPMV" "abcgcg $ABCG_CG" "abcgspmv-mpi-arm $ABCG_SPMV_MPI" \
     "abcgcg-mpi-arm $ABCG_CG_MPI"; do
     read -r prefix bin <<< "$program"
-    [ -n "$bin" ] && echo "$prefix binary: $bin (sha256 $(sha256sum "$bin" | cut -d' ' -f1))" \
+    [ -n "$bin" ] && echo "$prefix binary: $bin (sha256 $(sha256sum "$bin" | cut -d' ' -f1), $(strings "$bin" | grep -m1 '^PROVENANCE: ' || echo 'no PROVENANCE line'))" \
         >> "$out_dir/launch_settings"
 done
 [ -n "$ABCG_SPMV$ABCG_CG" ] && echo "abcg extra args: $ABCG_EXTRA_ARGS" >> "$out_dir/launch_settings"
+[ -n "$ABCG_CG" ] && echo "abcg cg args: $ABCG_CG_ARGS" >> "$out_dir/launch_settings"
+echo "per-iteration files: ITER=${ITER:-0} ITER_RAW=${ITER_RAW:-0} ITER_COMPRESS=${ITER_COMPRESS:-0}" >> "$out_dir/launch_settings"
+
+# Sets iter_args to the per-iteration flags for the run whose output file is $1; empty
+# unless ITER=1.
+iter_args_for() {
+    iter_args=()
+    [ "$ITER" = 1 ] || return 0
+    iter_args=(--iter-prefix "${1%.txt}")
+    [ "$ITER_RAW" = 1 ] && iter_args+=(--iter-raw)
+    [ "$ITER_COMPRESS" = 1 ] && iter_args+=(--iter-compress)
+    return 0
+}
 shuffle_seed=${SHUFFLE_SEED:-$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')}
 echo "$shuffle_seed" > "$out_dir/shuffle_seed"
 while read -r pattern k n; do
@@ -144,6 +170,7 @@ run=0
 while read -r pattern k n arm; do
     run=$((run + 1))
     run_file=$out_dir/run_$(printf %04d "$run")_${pattern}_${arm}_$(date +%Y%m%d-%H%M%S).txt
+    iter_args_for "$run_file"
     if [ "$arm" = MPI ]; then
         backend=(-c MPI)
     else
@@ -160,22 +187,25 @@ while read -r pattern k n arm; do
             if [ "${family%np}" = abcgcg ]; then
                 bin=$ABCG_CG
                 mpi_bin=$ABCG_CG_MPI
+                program_args=$ABCG_CG_ARGS
             else
                 bin=$ABCG_SPMV
                 mpi_bin=$ABCG_SPMV_MPI
+                program_args=
             fi
             if [ "$arm" = MPI ] && [ -n "$mpi_bin" ]; then
                 bin=$mpi_bin
             fi
             srun --nodes="$nodes" --ntasks-per-node="$SLURM_NTASKS_PER_NODE" "$bin" "$input_file" \
                 -c "$arm" -P "$pattern" -W "$warmup" -k "$k" -n "$n" --persistent "$persistent" \
-                $ABCG_EXTRA_ARGS \
+                $ABCG_EXTRA_ARGS $program_args "${iter_args[@]}" \
                 > "$run_file" 2>&1 < /dev/null
             ;;
         *)
             srun --nodes="$nodes" --ntasks-per-node="$SLURM_NTASKS_PER_NODE" "$BINARY" \
                 -r "${backend[@]}" -x EXPORT -q -b -W "$warmup" -I 1 \
-                -P "$pattern" -k "$k" -n "$n" $EXTRA_ARGS -f "$input_file" > "$run_file" 2>&1 < /dev/null
+                -P "$pattern" -k "$k" -n "$n" $EXTRA_ARGS "${iter_args[@]}" -f "$input_file" \
+                > "$run_file" 2>&1 < /dev/null
             ;;
     esac
     status=$?

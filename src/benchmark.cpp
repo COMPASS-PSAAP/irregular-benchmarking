@@ -4,8 +4,10 @@
 #include <cctype>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -13,9 +15,11 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <sched.h>
+#include <zlib.h>
 
 #include <Cabana_Core.hpp>
 #include <Kokkos_Core.hpp>
@@ -31,7 +35,9 @@ namespace {
 using cabana_datatype = double;
 using DataTypes = Cabana::MemberTypes<cabana_datatype>;
 using MemorySpace = Kokkos::HostSpace;
-using clock_type = std::chrono::high_resolution_clock;
+// Monotonic, so a clock step (NTP) cannot land in a timed interval;
+// high_resolution_clock is system_clock in libstdc++.
+using clock_type = std::chrono::steady_clock;
 
 constexpr int VectorLength = 2;
 
@@ -157,6 +163,238 @@ void runWarmup(warmup_t mode, int comm_rank, int comm_size) {
     MPI_Comm_free(&comm);
 }
 
+// Per-iteration times (--iter-prefix), kept in memory during a sample and written after
+// it; ABCG's benchmark_spmv writes the same files. start_s is wall-clock seconds since
+// the epoch (system_clock), comparable across nodes and jobs up to the nodes' clock
+// offsets, used only to place iterations in time; the durations come from clock_type.
+// apply_ms stops before the -b barrier, iter_ms after it (the value the totals sum).
+double wallSeconds() {
+    return std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+// Each rank's wall-clock (system_clock) offset from rank 0, so start_s can be compared
+// across nodes (scripts/barrier-skew.py). Rank 0 ping-pongs each rank in turn; from the
+// round with the smallest round trip, offset = reply time minus the midpoint of rank 0's
+// send and receive, good to +/- rtt/2. Collective; rank 0 gets (t, offset, rtt) per rank,
+// t being that midpoint in its own clock; the others get nothing.
+std::vector<double> measureClockOffsets(int comm_rank, int comm_size) {
+    constexpr int rounds = 50;
+    constexpr int tag = 4242;
+    std::vector<double> table;
+    if (comm_rank == 0) {
+        table.assign(3 * comm_size, 0.0);
+        table[0] = wallSeconds();
+        for (int r = 1; r < comm_size; ++r) {
+            double best_rtt = 1e30;
+            for (int k = 0; k < rounds; ++k) {
+                double ping = 0.0;
+                double reply = 0.0;
+                const double t0 = wallSeconds();
+                MPI_Send(&ping, 1, MPI_DOUBLE, r, tag, MPI_COMM_WORLD);
+                MPI_Recv(&reply, 1, MPI_DOUBLE, r, tag, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+                const double t1 = wallSeconds();
+                if (t1 - t0 < best_rtt) {
+                    best_rtt = t1 - t0;
+                    table[3 * r] = 0.5 * (t0 + t1);
+                    table[3 * r + 1] = reply - 0.5 * (t0 + t1);
+                    table[3 * r + 2] = best_rtt;
+                }
+            }
+        }
+    } else {
+        for (int k = 0; k < rounds; ++k) {
+            double ping = 0.0;
+            MPI_Recv(&ping, 1, MPI_DOUBLE, 0, tag, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            const double reply = wallSeconds();
+            MPI_Send(&reply, 1, MPI_DOUBLE, 0, tag, MPI_COMM_WORLD);
+        }
+    }
+    return table;
+}
+
+struct IterLog {
+    std::vector<double> start_s;
+    std::vector<float> apply_ms;
+    std::vector<float> iter_ms;
+    // --iter-raw only: measureClockOffsets() before and after the loop (rank 0).
+    std::vector<double> offsets_before, offsets_after;
+
+    void reserve(int count) {
+        start_s.reserve(count);
+        apply_ms.reserve(count);
+        iter_ms.reserve(count);
+    }
+    void record(double start, double apply, double iter) {
+        start_s.push_back(start);
+        apply_ms.push_back(static_cast<float>(apply));
+        iter_ms.push_back(static_cast<float>(iter));
+    }
+};
+
+// A numpy .npy (format 1.0) header for packed little-endian records with these fields.
+std::string npyHeader(const std::vector<std::pair<std::string, std::string>> &fields, const std::string &shape) {
+    std::string dict = "{'descr': [";
+    for (std::size_t i = 0; i < fields.size(); ++i) {
+        dict += (i ? ", ('" : "('") + fields[i].first + "', '" + fields[i].second + "')";
+    }
+    dict += "], 'fortran_order': False, 'shape': " + shape + ", }";
+    // magic, version and length take 10 bytes; the header ends with a newline at a
+    // multiple of 64.
+    dict.append((64 - (10 + dict.size() + 1) % 64) % 64, ' ');
+    dict += '\n';
+    std::string header("\x93NUMPY\x01\x00", 8);
+    header += static_cast<char>(dict.size() & 0xff);
+    header += static_cast<char>(dict.size() >> 8);
+    return header + dict;
+}
+
+template <class T>
+void appendBytes(std::string &out, T value) {
+    out.append(reinterpret_cast<const char *>(&value), sizeof(T));
+}
+
+// One gzip member; members written one after another read back as one gzip stream.
+std::string gzipBytes(const std::string &in) {
+    z_stream zs;
+    std::memset(&zs, 0, sizeof(zs));
+    deflateInit2(&zs, Z_DEFAULT_COMPRESSION, Z_DEFLATED, 15 + 16, 8, Z_DEFAULT_STRATEGY);
+    std::string out(deflateBound(&zs, in.size()), '\0');
+    zs.next_in = reinterpret_cast<Bytef *>(const_cast<char *>(in.data()));
+    zs.avail_in = in.size();
+    zs.next_out = reinterpret_cast<Bytef *>(&out[0]);
+    zs.avail_out = out.size();
+    const int status = deflate(&zs, Z_FINISH);
+    out.resize(zs.total_out);
+    deflateEnd(&zs);
+    if (status != Z_STREAM_END) {
+        printf("iter file: gzip failed (zlib status %d)\n", status);
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+    return out;
+}
+
+// Writes PREFIX_NAME_sSAMPLE.iter.npy[.gz]: one row per gather (window rows first),
+// reduced over ranks, from rank 0. With --iter-raw, also PREFIX_NAME_sSAMPLE.raw.npy[.gz]:
+// every rank's rows, shape (ranks, gathers), each rank's block (gzip member when
+// compressed) sent to rank 0 in rank order, and the clock offsets. Collective.
+void writeIterFiles(const std::string &name, int sample, const IterLog &log, int comm_rank, int comm_size) {
+    const int count = static_cast<int>(log.iter_ms.size());
+    const std::string base = iter_prefix + "_" + name + "_s" + std::to_string(sample);
+    const std::string ext = iter_compressed ? ".npy.gz" : ".npy";
+
+    // slowest_rank has the largest apply time. iter_min_rank has the smallest
+    // barrier-to-barrier time: a rank delayed outside apply() (between gathers, before its
+    // timer starts) arrives at the barrier last and waits least, so it is the one the
+    // others waited for even though its own apply looks normal.
+    struct FloatInt {
+        float value;
+        int rank;
+    };
+    std::vector<FloatInt> local_apply(count), max_loc(count), local_iter(count), min_loc(count);
+    std::vector<double> local_sum(log.apply_ms.begin(), log.apply_ms.end()), sum(count);
+    std::vector<float> apply_min(count), iter_max(count);
+    for (int i = 0; i < count; ++i) {
+        local_apply[i] = {log.apply_ms[i], comm_rank};
+        local_iter[i] = {log.iter_ms[i], comm_rank};
+    }
+    MPI_Reduce(local_apply.data(), max_loc.data(), count, MPI_FLOAT_INT, MPI_MAXLOC, 0, MPI_COMM_WORLD);
+    MPI_Reduce(local_iter.data(), min_loc.data(), count, MPI_FLOAT_INT, MPI_MINLOC, 0, MPI_COMM_WORLD);
+    MPI_Reduce(log.apply_ms.data(), apply_min.data(), count, MPI_FLOAT, MPI_MIN, 0, MPI_COMM_WORLD);
+    MPI_Reduce(local_sum.data(), sum.data(), count, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+    MPI_Reduce(log.iter_ms.data(), iter_max.data(), count, MPI_FLOAT, MPI_MAX, 0, MPI_COMM_WORLD);
+
+    if (comm_rank == 0) {
+        std::string out = npyHeader({{"start_s", "<f8"}, {"apply_max_ms", "<f4"}, {"apply_min_ms", "<f4"},
+                                     {"apply_mean_ms", "<f4"}, {"slowest_rank", "<i4"},
+                                     {"iter_max_ms", "<f4"}, {"iter_min_ms", "<f4"}, {"iter_min_rank", "<i4"}},
+                                    "(" + std::to_string(count) + ",)");
+        for (int i = 0; i < count; ++i) {
+            appendBytes(out, log.start_s[i]);
+            appendBytes(out, max_loc[i].value);
+            appendBytes(out, apply_min[i]);
+            appendBytes(out, static_cast<float>(sum[i] / comm_size));
+            appendBytes(out, static_cast<std::int32_t>(max_loc[i].rank));
+            appendBytes(out, iter_max[i]);
+            appendBytes(out, min_loc[i].value);
+            appendBytes(out, static_cast<std::int32_t>(min_loc[i].rank));
+        }
+        if (iter_compressed) {
+            out = gzipBytes(out);
+        }
+        const std::string path = base + ".iter" + ext;
+        FILE *file = fopen(path.c_str(), "wb");
+        if (!file || fwrite(out.data(), 1, out.size(), file) != out.size() || fclose(file) != 0) {
+            printf("iter file: cannot write %s\n", path.c_str());
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        }
+    }
+
+    if (!iter_raw) {
+        return;
+    }
+    const std::string header = npyHeader({{"start_s", "<f8"}, {"apply_ms", "<f4"}, {"iter_ms", "<f4"}},
+                                         "(" + std::to_string(comm_size) + ", " + std::to_string(count) + ")");
+    std::string block = comm_rank == 0 ? header : "";
+    for (int i = 0; i < count; ++i) {
+        appendBytes(block, log.start_s[i]);
+        appendBytes(block, log.apply_ms[i]);
+        appendBytes(block, log.iter_ms[i]);
+    }
+    if (iter_compressed) {
+        block = gzipBytes(block);
+    }
+    // Rank 0 writes the file, taking each rank's block in rank order. Collective MPI-IO
+    // (MPI_File_write_at_all) took about 10 minutes for 14-26 MB on dane's NFS workspace,
+    // from its file locking; this is the same plain write the reduced file uses.
+    constexpr int tag = 4243;
+    const std::string path = base + ".raw" + ext;
+    if (comm_rank != 0) {
+        long long size = static_cast<long long>(block.size());
+        MPI_Send(&size, 1, MPI_LONG_LONG, 0, tag, MPI_COMM_WORLD);
+        MPI_Send(block.data(), static_cast<int>(block.size()), MPI_BYTE, 0, tag, MPI_COMM_WORLD);
+    } else {
+        FILE *file = fopen(path.c_str(), "wb");
+        bool ok = file && fwrite(block.data(), 1, block.size(), file) == block.size();
+        for (int r = 1; r < comm_size; ++r) {
+            long long size = 0;
+            MPI_Recv(&size, 1, MPI_LONG_LONG, r, tag, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            block.resize(static_cast<std::size_t>(size));
+            MPI_Recv(&block[0], static_cast<int>(size), MPI_BYTE, r, tag, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            ok = ok && fwrite(block.data(), 1, block.size(), file) == block.size();
+        }
+        if (!ok || fclose(file) != 0) {
+            printf("iter file: cannot write %s\n", path.c_str());
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        }
+    }
+
+    // With --iter-raw: PREFIX_NAME_sSAMPLE.offsets.npy[.gz], one row per rank, the clock
+    // offsets measured before and after the loop.
+    if (comm_rank != 0) {
+        return;
+    }
+    std::string out = npyHeader({{"t_before_s", "<f8"}, {"offset_before_s", "<f8"}, {"rtt_before_s", "<f8"},
+                                 {"t_after_s", "<f8"}, {"offset_after_s", "<f8"}, {"rtt_after_s", "<f8"}},
+                                "(" + std::to_string(comm_size) + ",)");
+    for (int r = 0; r < comm_size; ++r) {
+        for (int c = 0; c < 3; ++c) {
+            appendBytes(out, log.offsets_before[3 * r + c]);
+        }
+        for (int c = 0; c < 3; ++c) {
+            appendBytes(out, log.offsets_after[3 * r + c]);
+        }
+    }
+    if (iter_compressed) {
+        out = gzipBytes(out);
+    }
+    const std::string offsets_path = base + ".offsets" + ext;
+    FILE *offsets_file = fopen(offsets_path.c_str(), "wb");
+    if (!offsets_file || fwrite(out.data(), 1, out.size(), offsets_file) != out.size() || fclose(offsets_file) != 0) {
+        printf("iter file: cannot write %s\n", offsets_path.c_str());
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+}
+
 struct SampleTimings {
     double halo = -1.0;
     double resize = -1.0;
@@ -168,6 +406,7 @@ struct SampleTimings {
     double window_apply = -1.0;
     double timed_apply = -1.0;
     double nosy_count = 0.0;
+    IterLog iters; // filled only under --iter-prefix
 };
 
 // Copied and adapted from
@@ -201,6 +440,17 @@ SampleTimings runSample(int num_tuple,
     timings.timed = 0.0;
     timings.window_apply = 0.0;
     timings.timed_apply = 0.0;
+    const bool record = !iter_prefix.empty();
+    int comm_rank = 0;
+    int comm_size = 1;
+    MPI_Comm_rank(MPI_COMM_WORLD, &comm_rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &comm_size);
+    if (record) {
+        timings.iters.reserve(nwindow + ntimed);
+    }
+    if (record && iter_raw) {
+        timings.iters.offsets_before = measureClockOffsets(comm_rank, comm_size);
+    }
     // Halo and gather setup leave ranks out of step; start the first gather together.
     if (barrier) {
         MPI_Barrier(MPI_COMM_WORLD);
@@ -210,6 +460,7 @@ SampleTimings runSample(int num_tuple,
             std::this_thread::sleep_for(std::chrono::milliseconds(nosy_time_ms));
             timings.nosy_count += 1.0;
         }
+        const double wall = record ? wallSeconds() : 0.0;
         start = clock_type::now();
         gather.apply();
         double apply_only = msSince(start);
@@ -225,6 +476,12 @@ SampleTimings runSample(int num_tuple,
             timings.timed += elapsed;
             timings.timed_apply += apply_only;
         }
+        if (record) {
+            timings.iters.record(wall, apply_only, elapsed);
+        }
+    }
+    if (record && iter_raw) {
+        timings.iters.offsets_after = measureClockOffsets(comm_rank, comm_size);
     }
     timings.apply = timings.window + timings.timed;
 
@@ -609,6 +866,16 @@ void run_benchmark() {
                            name.c_str(), q, startup, n_budget, calc_budget_s, nwindow);
                 }
                 fflush(stdout);
+            }
+            if (!iter_prefix.empty()) {
+                // Rank 0 writes every file, so its elapsed time is the whole cost; printed so
+                // a run shows what recording costs between runs.
+                const auto write_start = clock_type::now();
+                writeIterFiles(name, sample_iter, timings.iters, comm_rank, comm_size);
+                if (comm_rank == 0) {
+                    printf("-iter write (s): %.3f\n", msSince(write_start) / 1000.0);
+                    fflush(stdout);
+                }
             }
             if (comm_type == MPIADVANCE) {
                 if (verify) {

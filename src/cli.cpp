@@ -10,6 +10,8 @@
 #include <sstream>
 #include <string>
 
+#include <time.h>
+
 #include <Cabana_Core.hpp>
 #include <tclap/CmdLine.h>
 
@@ -19,6 +21,11 @@
 #include "pattern.hpp"
 
 namespace {
+
+// scripts/provenance.sh finds this with strings(1), so it must stay one literal; the
+// commits come from CMake (src/CMakeLists.txt).
+__attribute__((used)) const char provenance_line[] =
+    "PROVENANCE: source=" BENCH_SOURCE_COMMIT " locality_aware=" LOCALITY_AWARE_COMMIT;
 
 // Prints an error message and exits the program with an error code.
 void exitError(const std::string &error_message) {
@@ -60,6 +67,9 @@ void parseArgs(int argc, char **argv) {
         TCLAP::ValueArg<std::string> patternsArg("P", "patterns", "Comma-separated pattern names to run, in this order (default: every pattern in the config, in name order)", false, "", "names");
         TCLAP::ValueArg<std::string> warmupArg("W", "warmup", "Untimed point-to-point warmup of 64 B and 128 KiB messages before any pattern: none (default), nearest (rank +/- 1) or all (every other rank)", false, "none", "mode");
         TCLAP::SwitchArg distinctArg("U", "distinct-neighbors", "draw each rank's neighbors without replacement, so a rank never draws the same partner twice", false);
+        TCLAP::ValueArg<std::string> iterPrefixArg("", "iter-prefix", "Record every gather's time and write PREFIX_PATTERN_sSAMPLE.iter.npy after each sample: one row per gather, reduced over ranks (see README)", false, "", "prefix");
+        TCLAP::SwitchArg iterRawArg("", "iter-raw", "With --iter-prefix, also write PREFIX_PATTERN_sSAMPLE.raw.npy with every rank's rows and .offsets.npy with each rank's clock offset", false);
+        TCLAP::SwitchArg iterCompressArg("", "iter-compress", "With --iter-prefix, gzip the files (.npy.gz); on Dane it saved about 1.27x and did not shorten the write", false);
 
         TCLAP::SwitchArg reportParamsArg("r", "report-params", "Enables parameter reporting for use with analysis scripts", false);
         TCLAP::ValueArg<std::string> distributionArg("d", "distribution", "Choose from: gaussian (default), empirical or static", false, "gaussian", "string");
@@ -100,6 +110,9 @@ void parseArgs(int argc, char **argv) {
         cmd.add(patternsArg);
         cmd.add(warmupArg);
         cmd.add(verifyArg);
+        cmd.add(iterPrefixArg);
+        cmd.add(iterRawArg);
+        cmd.add(iterCompressArg);
         cmd.add(nosyPercentArg);
         cmd.add(nosyTimeArg);
 
@@ -110,6 +123,12 @@ void parseArgs(int argc, char **argv) {
         barrier = barrierArg.getValue();
         distinct_neighbors = distinctArg.getValue();
         verify = verifyArg.getValue();
+        iter_prefix = iterPrefixArg.getValue();
+        iter_raw = iterRawArg.getValue();
+        iter_compressed = iterCompressArg.getValue();
+        if (iter_prefix.empty() && (iter_raw || iter_compressed)) {
+            exitError("ERROR: --iter-raw and --iter-compress need --iter-prefix\n");
+        }
 
         nosy_percent = nosyPercentArg.getValue();
         nosy_time_ms = nosyTimeArg.getValue();
@@ -327,10 +346,24 @@ void parseArgs(int argc, char **argv) {
                 printf("-distinct neighbors: %s\n", distinct_neighbors ? "true" : "false");
                 printf("-nosy percent: %i\n", nosy_percent);
                 printf("-nosy time (ms): %i\n", nosy_time_ms);
+                if (!iter_prefix.empty()) {
+                    printf("-iter prefix: %s\n", iter_prefix.c_str());
+                    printf("-iter raw: %s\n", iter_raw ? "true" : "false");
+                    printf("-iter compressed: %s\n", iter_compressed ? "true" : "false");
+                }
                 // Rank 0 added rank 0 above, so this is the base seed either way.
                 printf("-seed: %i%s\n", seed, unique_seed ? " (per rank: seed + rank)" : "");
                 printf("-MPI library: %s\n", mpi_library_line.c_str());
                 printf("-compiler: %s\n", __VERSION__);
+                // The gather timer is steady_clock, CLOCK_MONOTONIC in libstdc++; its
+                // nominal period (1 ns) is not its resolution.
+                timespec monotonic_res{};
+                clock_getres(CLOCK_MONOTONIC, &monotonic_res);
+                printf("-MPI_Wtick: %g\n", MPI_Wtick());
+                printf("-steady_clock resolution (ns): %ld\n",
+                       monotonic_res.tv_sec * 1000000000L + monotonic_res.tv_nsec);
+                printf("-source commit: %s\n", BENCH_SOURCE_COMMIT);
+                printf("-locality_aware commit: %s\n", LOCALITY_AWARE_COMMIT);
                 printf("------------------------------------------------------------\n");
             } else {
                 printf("------------------------------------------------------------\n");
